@@ -1,0 +1,655 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+import math
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import torch
+import torch.distributed as dist
+from tokenspeed_kernel.platform import current_platform
+
+from tokenspeed.runtime.distributed.comm_backend import get_global_backend
+from tokenspeed.runtime.execution.slot_state import (
+    PREPARED_MARKER_BYTES,
+    pack_slot_rows,
+    read_prepared_marker,
+    slot_state_image_bytes,
+    unpack_slot_rows,
+    write_prepared_marker,
+)
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
+    from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+
+DEFAULT_RANDOM_SEED = 48
+CUDA_GRAPH_VARIANT_DEFAULT = "default"
+SPECULATIVE_ACCEPT_THRESHOLD_SINGLE = 1.0
+SPECULATIVE_ACCEPT_THRESHOLD_ACC = 1.0
+
+
+@dataclass(frozen=True)
+class SpeculativeSamplingPools:
+    """The verifier's pool-indexed per-request scalars a chain drafter reads
+    to sample its proposals from the request's own distribution
+    (``--enable-speculative-sampling``). Each is ``[max_req_pool_size + 1]``,
+    indexed by ``req_pool_idx``; the backend scatters them on admission."""
+
+    temperature: torch.Tensor  # fp32
+    top_k: torch.Tensor  # int32; greedy requests carry 1
+    seed: torch.Tensor  # int64 Philox seed
+
+
+@dataclass
+class SamplingBackendConfig:
+
+    synthetic_acceptance_length: float | None
+    # Draft-prob rejection sampling: verify gathers the drafter's recorded
+    # distributions by pool index into a persistent [max_pad_bs, N, vocab]
+    # fp32 buffer and runs the chain kernel's coin * q(x) < p(x) rule
+    # instead of the target-only rule. Selects the verify rule, so it is
+    # explicit.
+    enable_speculative_sampling: bool
+
+    # Random stream of the FlashInfer backends' sampled rows ("batch" or
+    # "per-request", see ServerArgs.sampling_stream). Behaviour-selecting, so
+    # it has no default: every constructor names the stream it wants.
+    sampling_stream: str
+    # Order of the selected-token log-softmax ("torch" or "megatron", see
+    # ServerArgs.logprob_order). Behaviour-selecting, so no default either.
+    logprob_order: str
+
+    enable_nan_detection: bool = False
+
+    # Optional logprob features — OFF by default. These are checked at server
+    # start / graph capture time so the fast path has zero extra compute.
+    # Enabling any of these enlarges the captured graph footprint.
+    enable_output_logprobs: bool = False
+
+    # Recorded draft probabilities above this are the "no proposal yet"
+    # sentinel; only read under enable_speculative_sampling.
+    spec_reject_draft_prob_threshold: float = 2.0
+
+    # Sizing for pre-allocated per-backend buffers (e.g. coin buffers for
+    # rejection sampling). Required to keep RNG out of the CUDA graph.
+    max_bs: int = 1
+    max_draft_tokens_per_req: int = 1
+
+    # Sizing for backend-owned per-request state (e.g. token-count buffers
+    # for penalties in FlashInferFullSamplingBackend). Indexed by req_pool_idx, not
+    # batch row, so the data survives batch membership changes.
+    max_req_pool_size: int = 0
+    vocab_size: int = 0
+
+    device: torch.device | None = None
+    random_seed: int = DEFAULT_RANDOM_SEED
+
+    # Attention TP group for sampler-output broadcast (rank 0 wins).
+    tp_group: tuple[int, ...] | None = None
+    enable_tp_sync: bool = True
+
+    @classmethod
+    def from_server_args(
+        cls,
+        server_args: ServerArgs,
+        *,
+        max_bs: int,
+        max_draft_tokens_per_req: int,
+        device: str,
+        random_seed: int = DEFAULT_RANDOM_SEED,
+        max_req_pool_size: int = 0,
+        vocab_size: int = 0,
+        tp_group: tuple[int, ...] | None = None,
+    ) -> SamplingBackendConfig:
+
+        return cls(
+            synthetic_acceptance_length=server_args.synthetic_acceptance_length,
+            sampling_stream=server_args.sampling_stream,
+            logprob_order=server_args.logprob_order,
+            enable_nan_detection=server_args.enable_nan_detection,
+            enable_output_logprobs=server_args.enable_output_logprobs,
+            enable_speculative_sampling=server_args.enable_speculative_sampling,
+            spec_reject_draft_prob_threshold=(
+                server_args.spec_reject_draft_prob_threshold
+            ),
+            max_bs=max_bs,
+            max_draft_tokens_per_req=max(max_draft_tokens_per_req, 1),
+            max_req_pool_size=max_req_pool_size,
+            vocab_size=vocab_size,
+            device=device,
+            random_seed=random_seed,
+            tp_group=tp_group,
+            enable_tp_sync=not server_args.disable_sampling_tp_sync,
+        )
+
+
+class SamplingBackend(ABC):
+    """Shared contract for single-step sampling and multi-step spec-decode verification.
+
+    Both methods return (output_tokens, accept_lengths). For sample(),
+    accept_lengths is all-ones so the downstream contract matches verify().
+
+    prepare_step() and prepare_capture() refill RNG-backed buffers outside
+    CUDA graph capture so replay reads fresh state from persistent storage.
+
+    Requests asking for params a backend doesn't implement are NOT rejected;
+    the backend silently applies only what it supports, so all requests go
+    through the same captured graph.
+
+    Per-slot state is part of the retraction image (``SlotStateExporter``):
+    a restored request samples exactly as it would have unretracted, so the
+    import suppresses the rid-flip reset for the restored slot.
+    """
+
+    # Subclasses that hold per-pool-idx state (scalars like temperature /
+    # top_k, plus large rows like _counts / _logit_bias) flip this to True
+    # so prepare_step() performs flip detection + _reset_slot. False skips
+    # pool-state work only; shared synthetic lengths still need refreshing.
+    _HAS_POOL_STATE: bool = False
+    _SUPPORTS_DP_VERIFY: bool = False
+    _SUPPORTS_SYNTHETIC_ACCEPTANCE: bool = False
+
+    constant_slot_state: tuple[str, ...] = ()
+    # Recomputed from the current frontier before every consumer; no restore.
+    token_derived_slot_state: tuple[str, ...] = ("_sampling_offsets_pool",)
+
+    def __init__(self, config: SamplingBackendConfig) -> None:
+
+        self.config = config
+
+        self._synthetic_generator: torch.Generator | None = None
+        self._synthetic_lengths: torch.Tensor | None = None
+        self._synthetic_coins: torch.Tensor | None = None
+        self._synthetic_floor: int = 0
+        self._synthetic_frac: float = 0.0
+        self._synthetic_is_integer: bool = True
+        if config.synthetic_acceptance_length is not None:
+            if not self._SUPPORTS_SYNTHETIC_ACCEPTANCE:
+                raise ValueError(
+                    "synthetic acceptance requires the greedy sampling backend"
+                )
+            al = config.synthetic_acceptance_length
+            if not math.isfinite(al) or not 1 <= al <= config.max_draft_tokens_per_req:
+                raise ValueError(
+                    f"synthetic_acceptance_length {al} must be within the verify width "
+                    f"[1, {config.max_draft_tokens_per_req}]"
+                )
+            self._synthetic_floor = math.floor(al)
+            self._synthetic_frac = al % 1
+            self._synthetic_is_integer = self._synthetic_frac == 0.0
+            self._synthetic_generator = torch.Generator(
+                device=config.device
+            ).manual_seed(config.random_seed)
+            self._synthetic_lengths = torch.full(
+                (config.max_bs,),
+                self._synthetic_floor,
+                dtype=torch.int32,
+                device=config.device,
+            )
+
+            if not self._synthetic_is_integer:
+                self._synthetic_coins = torch.empty(
+                    (config.max_bs,), device=config.device
+                )
+
+        # Sentinel of "which rid currently owns each slot from this backend's
+        # point of view". rid is just a comparison value here, not a lookup
+        # key, so this is pool-keyed state (size O(pool_rows) strings), not
+        # rid-keyed state. A mismatch against the incoming rid is a flip.
+        if self._HAS_POOL_STATE:
+            pool_rows = config.max_req_pool_size + 1
+            self._last_rid_per_slot: list[str | None] = [None] * pool_rows
+
+        # Pool-indexed kernels (the Triton Gumbel-max routes, the FlashInfer
+        # backends' per-request stream) take int32 pool indices and a
+        # pool-indexed offsets table; see _req_pool_indices_for_kernels and
+        # _prepare_sampling_offsets. Backends with DP padding re-carve them.
+        self._req_pool_indices_i32: torch.Tensor = torch.empty(
+            (0,), dtype=torch.int32, device=config.device
+        )
+        self._sampling_offsets_pool: torch.Tensor | None = (
+            torch.zeros(
+                (config.max_req_pool_size + 1,), dtype=torch.int64, device=config.device
+            )
+            if self._HAS_POOL_STATE
+            else None
+        )
+        if self._HAS_POOL_STATE:
+            self._allocate_pool_index_buffer(config.max_bs)
+
+        # Resolved once; None means maybe_broadcast is a no-op.
+        self._tp_pg = None
+        self._tp_src_global_rank: int | None = None
+        if (
+            config.enable_tp_sync
+            and config.tp_group is not None
+            and len(config.tp_group) > 1
+        ):
+            from tokenspeed.runtime.distributed.process_group_manager import (
+                process_group_manager as pg_manager,
+            )
+
+            self._tp_pg = pg_manager.get_device_process_group(config.tp_group)
+            self._tp_src_global_rank = config.tp_group[0]
+
+        # Verify outputs live in one packed int32 buffer so a single broadcast
+        # syncs predict, accept_length and accept_index across TP ranks.
+        # Backends with DP padding re-carve it for their padded batch.
+        self._predict_max: int = 0
+        self._output_pack_buf: torch.Tensor = torch.empty(
+            (0,), dtype=torch.int32, device=config.device
+        )
+        self._predict_buf: torch.Tensor = self._output_pack_buf
+        self._accept_length_buf: torch.Tensor = self._output_pack_buf
+        self._accept_index_buf: torch.Tensor = self._output_pack_buf
+        self._allocate_verify_outputs(config.max_bs, config.max_draft_tokens_per_req)
+
+    def _allocate_verify_outputs(self, max_rows: int, max_n: int) -> None:
+        """Carve predict / accept_length / accept_index out of one buffer.
+
+        Layout: ``[0, max_rows * max_n)`` predict, then ``max_rows``
+        accept_length entries, then ``max_rows * max_n`` accept_index entries.
+        Each region is flat so ``[:bs * n].view(bs, n)`` is contiguous for
+        any bs/n, and the whole buffer is what ``broadcast_verify_outputs``
+        sends.
+        """
+        self._predict_max = max_rows * max_n
+        self._output_pack_buf = torch.zeros(
+            (2 * self._predict_max + max_rows,),
+            dtype=torch.int32,
+            device=self.config.device,
+        )
+        self._predict_buf = self._output_pack_buf[: self._predict_max]
+        self._accept_length_buf = self._output_pack_buf[
+            self._predict_max : self._predict_max + max_rows
+        ]
+        self._accept_index_buf = self._output_pack_buf[self._predict_max + max_rows :]
+
+    def _allocate_pool_index_buffer(self, max_rows: int) -> None:
+        """Size the int32 pool-index staging buffer for up to ``max_rows`` rows."""
+        self._req_pool_indices_i32 = torch.empty(
+            (max_rows,), dtype=torch.int32, device=self.config.device
+        )
+
+    def _req_pool_indices_for_kernels(
+        self, req_pool_indices: torch.Tensor, rows: int
+    ) -> torch.Tensor:
+        """The first ``rows`` pool indices as the int32 the pool kernels take.
+
+        int64 indices (the scheduler's) are staged into a persistent buffer
+        with an in-graph copy; int32 ones are handed over as they are.
+        """
+        req_pool_indices = req_pool_indices[:rows]
+        if req_pool_indices.dtype == torch.int32:
+            return req_pool_indices
+        if req_pool_indices.dtype != torch.int64:
+            raise ValueError(
+                "pool-indexed sampling requires int32/int64 req_pool_indices, "
+                f"got {req_pool_indices.dtype}"
+            )
+        out = self._req_pool_indices_i32[:rows]
+        out.copy_(req_pool_indices, non_blocking=True)
+        return out
+
+    def _prepare_sampling_offsets(
+        self, sampling_info: SamplingBatchInfo
+    ) -> torch.Tensor:
+        """Prepare just this sampler call's slots, on the sampling stream.
+
+        Offsets are scratch for the pool-kernel ABI, not request state. Slot
+        zero remains the padding sentinel; omitted/open-prefill rows do no work.
+        """
+        if sampling_info.valid_cache_lengths is None:
+            raise ValueError(
+                "Sampling offsets require valid_cache_lengths, including during "
+                "warmup and CUDA graph capture"
+            )
+        from tokenspeed_kernel.ops.sampling import prepare_sampling_offsets
+
+        assert self._sampling_offsets_pool is not None
+        prepare_sampling_offsets(
+            sampling_info.valid_cache_lengths,
+            sampling_info.req_pool_indices,
+            sampling_info.extend_lengths,
+            out=self._sampling_offsets_pool,
+        )
+        return self._sampling_offsets_pool
+
+    def broadcast_verify_outputs(self) -> None:
+        """Broadcast the packed verify triple from tp_group[0] in one collective.
+
+        Rank 0 wins on predict, accept_length and accept_index together,
+        including stale rows past the live batch. No-op when sync is off or
+        tp_size <= 1. Graph-safe.
+        """
+        self.maybe_broadcast(self._output_pack_buf)
+
+    def accepted_path(self, bs: int, num_nodes: int) -> torch.Tensor:
+        """``[bs, N]`` accepted path (root first, ``-1`` past it) of the last
+        tree verify, as agreed across TP ranks."""
+        return self._accept_index_buf[: bs * num_nodes].view(bs, num_nodes)
+
+    def reads_only_argmax(self) -> bool:
+        """Whether ``sample`` and ``verify`` need nothing of the target logits
+        but each row's argmax, which they then take from
+        ``LogitsProcessorOutput.next_token_ids``."""
+        return False
+
+    def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
+        """Configure optional DP sampling state.
+
+        Stateless or unsupported backends ignore this; DP-capable backends
+        override it to initialize backend-local communication buffers.
+        """
+
+    def speculative_sampling_pools(self) -> SpeculativeSamplingPools:
+        """The pool-indexed scalars a chain drafter samples its proposals with.
+
+        Only backends whose verify runs the draft-prob chain kernel keep
+        them; server-args resolution refuses the flag for the others, so
+        reaching this default is a wiring error, not a request error.
+
+        Raises:
+            NotImplementedError: This backend has no draft-prob verify.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} has no draft-prob verify; "
+            "--enable-speculative-sampling needs the flashinfer or "
+            "flashinfer_full sampling backend"
+        )
+
+    def maybe_broadcast(self, *tensors: torch.Tensor) -> None:
+        """Broadcast each tensor from tp_group[0] so all attention-TP ranks
+        agree. No-op when sync is off or tp_size <= 1. Graph-safe."""
+        if self._tp_pg is None:
+            return
+        for t in tensors:
+            if (
+                current_platform().is_cdna4
+                and self.config.tp_group is not None
+                and get_global_backend().broadcast_from_first_rank(
+                    t, self.config.tp_group
+                )
+            ):
+                continue
+            dist.broadcast(t, src=self._tp_src_global_rank, group=self._tp_pg)
+
+    def prepare_step(
+        self,
+        request_ids: list[str],
+        request_pool_indices: list[int],
+        sampling_params_list: list[SamplingParams],
+        num_tokens_per_req: int = 1,
+    ) -> None:
+        """Called once per step, outside the CUDA graph.
+
+        Synthetic lengths refresh even for backends without pool state so
+        graph replay sees fresh lengths. Pool-state backends also perform:
+
+        1. Flip detection: a slot's owning rid changed since last step
+           (first-use and rid-recycling look the same). Delegates to
+           _reset_slot which scatters all per-slot persistent state
+           (scalars, counts, bias, generators).
+        2. Per-step dynamic refill: coin buffers, etc. Delegated to the
+           subclass via _prepare_step_hook.
+
+        Stateless backends (greedy) skip these two pool-state phases.
+        """
+
+        self._prepare_synthetic_acceptance()
+        if not self._HAS_POOL_STATE:
+            return
+
+        assert (
+            len(request_ids) == len(request_pool_indices) == len(sampling_params_list)
+        ), (
+            f"prepare_step expects aligned per-request lists; got "
+            f"rids={len(request_ids)}, pool_indices={len(request_pool_indices)}, "
+            f"sp_list={len(sampling_params_list)}"
+        )
+
+        pool_rows = len(self._last_rid_per_slot)
+        for rid, pool_idx, sp in zip(
+            request_ids, request_pool_indices, sampling_params_list
+        ):
+            assert (
+                0 <= pool_idx < pool_rows
+            ), f"pool_idx {pool_idx} out of range [0, {pool_rows}) for rid={rid}"
+            if self._last_rid_per_slot[pool_idx] != rid:
+                self._reset_slot(pool_idx, sp)
+                self._last_rid_per_slot[pool_idx] = rid
+
+        self._prepare_step_hook(
+            num_tokens_per_req=num_tokens_per_req,
+            bs=len(request_pool_indices),
+            request_pool_indices=request_pool_indices,
+        )
+
+    def prepare_capture(self, bs: int, num_tokens_per_req: int = 1) -> None:
+        """Refill buffers before capture/warm-up without slot ownership changes.
+
+        Synthetic lengths and backend RNG buffers must be written before
+        capture so captured operations read initialized persistent storage.
+        """
+        self._prepare_synthetic_acceptance()
+        self._prepare_step_hook(
+            num_tokens_per_req=num_tokens_per_req,
+            bs=bs,
+            request_pool_indices=None,
+        )
+
+    def _prepare_synthetic_acceptance(self) -> None:
+        if self._synthetic_lengths is None:
+            return
+        if self._synthetic_is_integer:
+            self._synthetic_lengths.fill_(self._synthetic_floor)
+            return
+        # Refill outside capture, like the rejection sampler's coin buffers.
+        # A private device generator avoids host copies and global RNG state.
+        self._synthetic_coins.uniform_(generator=self._synthetic_generator)
+        torch.lt(
+            self._synthetic_coins, self._synthetic_frac, out=self._synthetic_lengths
+        )
+        self._synthetic_lengths.add_(self._synthetic_floor)
+
+    def synthetic_lengths(
+        self, candidates: torch.Tensor, row_offset: int
+    ) -> torch.Tensor:
+        """Read lengths in full-batch order; row_offset skips any prefill rows."""
+        bs, n = candidates.shape
+        return self._synthetic_lengths[row_offset : row_offset + bs].clamp(max=n)
+
+    def limit_synthetic_acceptance(
+        self, force_single_token: torch.Tensor, row_offset: int
+    ) -> None:
+        """Bootstrap rows without draft candidates must sample one target token."""
+        self._synthetic_lengths[
+            row_offset : row_offset + force_single_token.numel()
+        ].masked_fill_(force_single_token, 1)
+
+    def write_synthetic_outputs(
+        self,
+        candidates: torch.Tensor,
+        target_tokens: torch.Tensor,
+        lengths: torch.Tensor,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_length: torch.Tensor,
+    ) -> None:
+        """Commit a draft prefix followed by its target correction/bonus token."""
+        bs, n = candidates.shape
+        positions = torch.arange(n, device=candidates.device).expand(bs, n)
+        output = predict.view(bs, n)
+        output[:, : n - 1].copy_(candidates[:, 1:])
+        output.masked_fill_(positions >= lengths[:, None] - 1, 0)
+        output.scatter_(
+            1, (lengths - 1).long()[:, None], target_tokens.to(predict.dtype)[:, None]
+        )
+        accept_index.copy_(
+            torch.where(
+                positions < lengths[:, None],
+                positions + torch.arange(bs, device=candidates.device)[:, None] * n,
+                -1,
+            )
+        )
+        accept_length.copy_(lengths - 1)
+
+    def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
+        """Return sampler-specific CUDA graph variants to capture."""
+        return (CUDA_GRAPH_VARIANT_DEFAULT,)
+
+    def prepare_capture_variant(
+        self,
+        bs: int,
+        num_tokens_per_req: int,
+        variant: str,
+    ) -> None:
+        if variant != CUDA_GRAPH_VARIANT_DEFAULT:
+            raise ValueError(f"Unsupported CUDA graph variant: {variant}")
+        self.prepare_capture(bs=bs, num_tokens_per_req=num_tokens_per_req)
+
+    def cuda_graph_replay_variant(self, num_tokens_per_req: int) -> str:
+        return CUDA_GRAPH_VARIANT_DEFAULT
+
+    def _prepare_step_hook(
+        self,
+        num_tokens_per_req: int,
+        bs: int,
+        request_pool_indices: list[int] | None,
+    ) -> None:
+        """Subclass hook for per-step dynamic state (coin buffers, etc).
+        request_pool_indices=None is the capture path; otherwise the CPU
+        list from forward_op.request_pool_indices.
+        Default: no-op."""
+
+    def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:
+        """Scatter all per-slot persistent state for a newly-assigned slot.
+        Called from prepare_step on flip. Stateful backends override."""
+        raise NotImplementedError
+
+    def reset_capture_state(self) -> None:
+        """Clear any per-pool state that warm-up iterations may have dirtied
+        before CUDA graph capture. Warm-up runs sample()/verify() against
+        pool row 0 (see ForwardStepRunner capture path); stateful backends
+        override this to zero whatever row 0 accumulates. Default: no-op."""
+
+    # ------------------------------------------------------------------
+    # Slot-state image (SlotStateExporter)
+    # ------------------------------------------------------------------
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        """The per-slot Device rows a retraction snapshot images, in a fixed order.
+
+        Everything ``_reset_slot`` scatters for a new occupant -- the
+        sampling scalars, the penalty counts, the logit bias -- because the
+        restore suppresses that reset for the restored slot. A stateless
+        backend keeps the empty default.
+        """
+        del slot
+        return []
+
+    def slot_state_bytes(self) -> int:
+        # A pool-stateful backend images the prepared marker ahead of its
+        # payload (``slot_state.py``); a stateless one images nothing.
+        if not self._HAS_POOL_STATE:
+            return 0
+        return PREPARED_MARKER_BYTES + self._slot_payload_bytes()
+
+    def _slot_payload_bytes(self) -> int:
+        """Bytes of the slot's rows behind the marker; subclasses add theirs."""
+        return slot_state_image_bytes(self.slot_state_rows(0))
+
+    def _export_slot_payload(self, slot: int, out: torch.Tensor, stream) -> None:
+        pack_slot_rows(self.slot_state_rows(slot), out, stream)
+
+    def _import_slot_payload(self, slot: int, src: torch.Tensor, stream) -> None:
+        unpack_slot_rows(self.slot_state_rows(slot), src, stream)
+
+    def export_slot_state(
+        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        if not self._HAS_POOL_STATE:
+            return
+        # The slot holds ``request_id``'s state only once prepare_step ran a
+        # forward for it there; a victim retracted before its first forward
+        # (a PD decode role's landed request) still holds the previous
+        # occupant's, so the image carries the marker alone.
+        prepared = self._last_rid_per_slot[slot] == request_id
+        write_prepared_marker(out, prepared)
+        if prepared:
+            self._export_slot_payload(slot, out[PREPARED_MARKER_BYTES:], stream)
+
+    def import_slot_state(
+        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        if not self._HAS_POOL_STATE:
+            return
+        if read_prepared_marker(src):
+            self._import_slot_payload(slot, src[PREPARED_MARKER_BYTES:], stream)
+            # ``prepare_step`` compares the incoming rid against this sentinel;
+            # a match is not a flip, so the restored rows are not reset as a
+            # new occupant's.
+            self._last_rid_per_slot[slot] = request_id
+        else:
+            # Nobody's: the first prepare_step resets the slot from the
+            # request's own SamplingParams, as it would have unretracted.
+            self._last_rid_per_slot[slot] = None
+
+    def get_packed_output_d2h(
+        self,
+        output_tokens: torch.Tensor,
+        output_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """If the backend wrote both outputs into a single contiguous GPU
+        buffer, return CPU views obtained from one D2H copy. Otherwise
+        return None and let the caller fall back to two separate D2Hs."""
+        return None
+
+    # Backends whose verify() takes draft trees (tree=TreeVerifyBatch).
+    supports_tree_verify: bool = False
+
+    @abstractmethod
+    def sample(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    @abstractmethod
+    def verify(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        candidates: torch.Tensor,
+        *,
+        tree: TreeVerifyBatch | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Verify each request's draft window; ``tree`` is the draft tree
+        (``None`` for a chain) and needs ``supports_tree_verify``; a tree
+        verify leaves its agreed path in ``accepted_path``."""

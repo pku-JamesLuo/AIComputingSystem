@@ -1,0 +1,869 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+import contextlib
+import ctypes
+import logging
+import math
+import os
+import site
+import sys
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
+from functools import cache, lru_cache
+from pathlib import Path
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "ArchVersion",
+    "InterconnectInfo",
+    "PlatformInfo",
+    "CapabilityRequirement",
+    "Platform",
+    "current_platform",
+    "max_active_ctas",
+    "prepare_cuda_toolkit_env",
+]
+
+
+def prepare_cuda_toolkit_env() -> None:
+    """Expose a wheel-provided CUDA toolkit to extensions that require nvcc."""
+    site_paths = []
+    try:
+        site_paths.extend(site.getsitepackages())
+    except Exception:
+        pass
+    site_paths.extend(sys.path)
+
+    candidates = []
+    requested_cuda_home = os.environ.get("CUDA_HOME")
+    if requested_cuda_home:
+        candidates.append(Path(requested_cuda_home))
+    for base in site_paths:
+        candidates.extend(sorted((Path(base) / "nvidia").glob("cu*"), reverse=True))
+
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        if not (
+            (candidate / "include" / "cuda_runtime.h").exists()
+            and (candidate / "bin" / "nvcc").exists()
+        ):
+            continue
+
+        os.environ["CUDA_HOME"] = str(candidate)
+        _prepend_env_path("CPATH", candidate / "include")
+        _prepend_env_path("PATH", candidate / "bin")
+        return
+
+
+def _prepend_env_path(name: str, path: Path) -> None:
+    value = str(path)
+    entries = [entry for entry in os.environ.get(name, "").split(os.pathsep) if entry]
+    if value not in entries:
+        os.environ[name] = os.pathsep.join([value, *entries])
+
+
+def _npu_is_available() -> bool:
+    """Return whether torch-npu is installed and an Ascend device is visible."""
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return bool(torch.npu.is_available())
+
+
+# ---------------------------------------------------------------------------
+# Core data structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ArchVersion:
+    """Hardware generation identifier. Supports comparison operators."""
+
+    major: int
+    minor: int
+
+    def __ge__(self, other: ArchVersion) -> bool:
+        return (self.major, self.minor) >= (other.major, other.minor)
+
+    def __gt__(self, other: ArchVersion) -> bool:
+        return (self.major, self.minor) > (other.major, other.minor)
+
+    def __le__(self, other: ArchVersion) -> bool:
+        return (self.major, self.minor) <= (other.major, other.minor)
+
+    def __lt__(self, other: ArchVersion) -> bool:
+        return (self.major, self.minor) < (other.major, other.minor)
+
+    def __str__(self) -> str:
+        return f"{self.major}.{self.minor}"
+
+
+@dataclass(frozen=True)
+class InterconnectInfo:
+    """Multi-GPU interconnect topology."""
+
+    topology: str  # "single_gpu", "pcie", "nvlink_pairs", "nvlink_full", "nvswitch"
+    bandwidth_matrix: tuple[tuple[float, ...], ...] | None = None
+    nvlink_version: int | None = None
+    nvswitch_present: bool = False
+
+
+@dataclass(frozen=True)
+class PlatformInfo:
+    """Complete description of a compute platform."""
+
+    vendor: str  # "nvidia", "amd", "ascend"
+    arch_version: ArchVersion
+    device_name: str
+    device_count: int
+
+    # Memory
+    total_memory: int  # Bytes per device
+    memory_bandwidth: float  # GB/s
+
+    # Compute
+    sm_count: int  # Streaming multiprocessors (or CUs)
+    max_threads_per_sm: int
+    max_shared_memory_per_sm: int  # Bytes
+
+    # Features (string-based for extensibility)
+    sm_features: frozenset[str] = frozenset()  # Determined by compute capability
+    runtime_features: frozenset[str] = frozenset()  # Detected at runtime
+
+    # Interconnect (for multi-GPU)
+    interconnect: InterconnectInfo | None = None
+
+    # NUMA-local CPU IDs per logical device. Empty means unavailable.
+    numa_cpu_affinity: tuple[tuple[int, ...], ...] = ()
+
+    @classmethod
+    def detect(cls) -> PlatformInfo:
+        """Detect platform from current environment."""
+        return _detect_platform()
+
+    # Convenience properties
+    @property
+    def is_nvidia(self) -> bool:
+        return self.vendor == "nvidia"
+
+    @property
+    def is_hopper(self) -> bool:
+        return self.is_nvidia and self.arch_version.major == 9
+
+    @property
+    def is_blackwell(self) -> bool:
+        return self.is_nvidia and self.arch_version.major == 10
+
+    @property
+    def is_ampere(self) -> bool:
+        return self.is_nvidia and self.arch_version.major == 8
+
+    @property
+    def is_amd(self) -> bool:
+        return self.vendor == "amd"
+
+    @property
+    def is_npu(self) -> bool:
+        return self.vendor == "ascend"
+
+    @property
+    def is_cdna4(self) -> bool:
+        return self.is_amd and self.arch_version == ArchVersion(9, 5)
+
+    @property
+    def is_cdna5(self) -> bool:
+        return self.is_amd and self.arch_version == ArchVersion(12, 5)
+
+    @property
+    def is_ampere_plus(self) -> bool:
+        return self.is_nvidia and self.arch_version >= ArchVersion(8, 0)
+
+    @property
+    def is_hopper_plus(self) -> bool:
+        return self.is_nvidia and self.arch_version >= ArchVersion(9, 0)
+
+    @property
+    def is_blackwell_plus(self) -> bool:
+        return self.is_nvidia and self.arch_version >= ArchVersion(10, 0)
+
+    @property
+    def is_cdna4_plus(self) -> bool:
+        return self.is_cdna4 or self.is_cdna5_plus
+
+    @property
+    def is_cdna5_plus(self) -> bool:
+        return self.is_amd and self.arch_version >= ArchVersion(12, 5)
+
+    @property
+    def arch(self) -> str:
+        """Short architecture string for cache keys."""
+        return str(self.arch_version)
+
+    def register_host_tensor_for_gpu_access(self, tensor: torch.Tensor) -> None:
+        """Register host memory that GPU kernels will directly dereference."""
+        if tensor.device.type != "cpu" or tensor.numel() == 0:
+            return
+        status = torch.cuda.cudart().cudaHostRegister(
+            tensor.data_ptr(), tensor.numel() * tensor.element_size(), 0
+        )
+        if int(status) != 0:
+            raise RuntimeError(f"cudaHostRegister failed with {status!s}")
+
+    def device_visible_data_ptr(self, tensor: torch.Tensor) -> int:
+        """Return a pointer value that is valid to dereference from GPU kernels."""
+        ptr = tensor.data_ptr()
+        if self.is_amd and tensor.device.type == "cpu" and tensor.numel() > 0:
+            return _hip_host_get_device_pointer(ptr)
+        return ptr
+
+    @contextlib.contextmanager
+    def restore_stack_limit(self) -> Iterator[None]:
+        """Restore, when the block exits normally, the stack limit its kernels raised.
+
+        CUDA raises the current context's limit to fit each kernel at launch and
+        keeps local memory reserved for it on every SM until the limit is set
+        lower again. A no-op on other vendors.
+        """
+        if not self.is_nvidia:
+            yield
+            return
+        from cuda.bindings import driver
+
+        stack = driver.CUlimit.CU_LIMIT_STACK_SIZE
+        error, limit = driver.cuCtxGetLimit(stack)
+        if error != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuCtxGetLimit failed with {error!s}")
+        yield
+        (error,) = driver.cuCtxSetLimit(stack, limit)
+        if error != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuCtxSetLimit failed with {error!s}")
+
+    @property
+    def generation_name(self) -> str:
+        """Human-readable generation name."""
+        arch_version = (self.arch_version.major, self.arch_version.minor)
+        if self.is_nvidia:
+            names = {
+                (8, 0): "Ampere",
+                (8, 6): "Ampere",
+                (8, 9): "Ada Lovelace",
+                (9, 0): "Hopper",
+                (10, 0): "Blackwell",
+            }
+            return names.get(arch_version, f"SM{arch_version[0]}.{arch_version[1]}")
+        if self.is_amd:
+            names = {
+                (9, 5): "CDNA4",  # MI350
+                (12, 0): "RDNA4",
+                (12, 5): "CDNA5",
+            }
+            return names.get(arch_version, f"GFX{arch_version[0]}.{arch_version[1]}")
+        return f"{self.vendor}:{arch_version[0]}.{arch_version[1]}"
+
+
+@dataclass(frozen=True)
+class CapabilityRequirement:
+    """Requirements a kernel has on platform capabilities."""
+
+    min_arch_version: ArchVersion | None = None
+    max_arch_version: ArchVersion | None = None
+    required_features: frozenset[str] = frozenset()
+    vendors: frozenset[str] | None = None  # None = any vendor
+    # Per-vendor minimum arch for kernels that serve several vendors, whose
+    # arch numbering differs (e.g. NVIDIA sm100 vs AMD gfx950). Use instead
+    # of min_arch_version, with one floor for every vendor in ``vendors``.
+    vendor_min_arch_versions: Mapping[str, ArchVersion] = field(
+        default_factory=dict, hash=False
+    )
+
+    def __post_init__(self) -> None:
+        if not self.vendor_min_arch_versions:
+            return
+        if self.min_arch_version is not None:
+            raise ValueError(
+                "set min_arch_version or vendor_min_arch_versions, not both"
+            )
+        if self.vendors is None or set(self.vendor_min_arch_versions) != self.vendors:
+            raise ValueError(
+                "vendor_min_arch_versions must give a floor for every vendor in "
+                "vendors, and only for those"
+            )
+
+    def min_arch_version_for(self, vendor: str) -> ArchVersion | None:
+        """The minimum arch version required on ``vendor``, if any."""
+        if self.vendor_min_arch_versions:
+            return self.vendor_min_arch_versions.get(vendor)
+        return self.min_arch_version
+
+    def satisfied_by(self, platform: PlatformInfo) -> bool:
+        """Check if platform satisfies these requirements."""
+        if self.vendors and platform.vendor not in self.vendors:
+            return False
+
+        min_arch_version = self.min_arch_version_for(platform.vendor)
+        if min_arch_version:
+            if not platform.arch_version >= min_arch_version:
+                return False
+
+        if self.max_arch_version:
+            if platform.arch_version > self.max_arch_version:
+                return False
+
+        all_features = platform.sm_features | platform.runtime_features
+        if not self.required_features.issubset(all_features):
+            return False
+
+        return True
+
+    def missing_features(self, platform: PlatformInfo) -> set[str]:
+        """Return features required but not available."""
+        all_features = platform.sm_features | platform.runtime_features
+        return self.required_features - all_features
+
+
+# ---------------------------------------------------------------------------
+# Platform singleton
+# ---------------------------------------------------------------------------
+
+
+class Platform:
+    """Global platform singleton with lazy initialization."""
+
+    _instance: PlatformInfo | None = None
+
+    @classmethod
+    def get(cls) -> PlatformInfo:
+        """Get current platform info (detected once, cached)."""
+        if cls._instance is None:
+            cls._instance = PlatformInfo.detect()
+        return cls._instance
+
+    @classmethod
+    def override(cls, platform: PlatformInfo) -> None:
+        """Override platform detection (for testing/debugging)."""
+        cls._instance = platform
+
+    @classmethod
+    def reset(cls) -> None:
+        """Reset cached platform (for testing)."""
+        cls._instance = None
+        _detect_cuda_nvlink_topology.cache_clear()
+
+
+def current_platform() -> PlatformInfo:
+    """Get current platform."""
+    return Platform.get()
+
+
+@cache
+def max_active_ctas(kernel) -> int:
+    """Return the resident CTAs per SM/CU for a compiled non-cluster kernel.
+
+    The driver accounts for the loaded kernel's registers, shared memory and
+    threads. Results are cached by the device-specific compiled specialization.
+
+    Args:
+        kernel: A compiled Triton or Gluon kernel with one CTA per cluster.
+
+    Returns:
+        The maximum number of simultaneously resident CTAs on one SM/CU.
+    """
+    kernel._init_handles()
+    if kernel.metadata.num_ctas != 1:
+        raise ValueError("CTA occupancy requires a non-cluster kernel")
+    backend = kernel.metadata.target.backend
+    if backend == "cuda":
+        library = ctypes.CDLL("libcuda.so.1")
+        query = library.cuOccupancyMaxActiveBlocksPerMultiprocessor
+    elif backend == "hip":
+        from tokenspeed_kernel._triton import get_hip_runtime_path
+
+        # Kernel handles belong to the runtime that loaded the Triton module.
+        library = ctypes.CDLL(get_hip_runtime_path())
+        query = library.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor
+    else:
+        raise ValueError(f"Unsupported occupancy backend: {backend}")
+    query.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_size_t,
+    ]
+    query.restype = ctypes.c_int
+    resident = ctypes.c_int()
+    status = query(
+        ctypes.byref(resident),
+        kernel.function,
+        kernel.metadata.num_warps * kernel.metadata.target.warp_size,
+        kernel.metadata.shared,
+    )
+    if status != 0 or resident.value < 1:
+        raise RuntimeError(
+            f"{backend} occupancy query failed: {status}, {resident.value}"
+        )
+    return resident.value
+
+
+_pdl_enabled: bool | None = None
+
+
+def pdl_enabled(overwrite: bool | None = None) -> bool:
+    global _pdl_enabled
+    if overwrite is not None:
+        _pdl_enabled = bool(overwrite) and current_platform().is_hopper_plus
+    elif _pdl_enabled is None:
+        _pdl_enabled = current_platform().is_hopper_plus
+    return _pdl_enabled
+
+
+# ---------------------------------------------------------------------------
+# Detection implementation
+# ---------------------------------------------------------------------------
+
+
+def _detect_platform() -> PlatformInfo:
+    """Detect current platform capabilities."""
+    try:
+        import torch
+    except ImportError:
+        raise RuntimeError(
+            "tokenspeed-kernel requires PyTorch with NVIDIA CUDA or AMD ROCm support."
+        ) from None
+
+    if torch.cuda.is_available():
+        if hasattr(torch.version, "hip") and torch.version.hip:
+            return _detect_rocm_platform()
+        return _detect_cuda_platform()
+
+    if _npu_is_available():
+        return _detect_npu_platform()
+
+    raise RuntimeError(
+        "tokenspeed-kernel requires an NVIDIA CUDA, AMD ROCm, or Ascend NPU device."
+    )
+
+
+def _detect_npu_platform() -> PlatformInfo:
+    """Detect an Ascend platform exposed through torch-npu."""
+    props = torch.npu.get_device_properties(torch.npu.current_device())
+    return PlatformInfo(
+        vendor="ascend",
+        arch_version=ArchVersion(9, 1),
+        device_name=props.name,
+        device_count=torch.npu.device_count(),
+        total_memory=props.total_memory,
+        memory_bandwidth=0.0,
+        sm_count=getattr(props, "cube_core_num", 0),
+        max_threads_per_sm=0,
+        max_shared_memory_per_sm=0,
+        sm_features=frozenset({"tensor_core:f16", "tensor_core:bf16"}),
+        runtime_features=frozenset({"runtime:acl_graph"}),
+        interconnect=InterconnectInfo(topology="single_gpu"),
+    )
+
+
+def _detect_cuda_platform() -> PlatformInfo:
+    """Detect NVIDIA CUDA platform."""
+    import torch
+
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    arch_version = ArchVersion(props.major, props.minor)
+    sm_features = _get_cuda_sm_features(arch_version)
+    runtime_features = _get_cuda_runtime_features()
+    interconnect = _detect_cuda_interconnect()
+    numa_cpu_affinity = _detect_cuda_numa_cpu_affinity()
+
+    return PlatformInfo(
+        vendor="nvidia",
+        arch_version=arch_version,
+        device_name=props.name,
+        device_count=torch.cuda.device_count(),
+        total_memory=props.total_memory,
+        memory_bandwidth=_estimate_bandwidth(props),
+        sm_count=props.multi_processor_count,
+        max_threads_per_sm=getattr(props, "max_threads_per_multi_processor", 0),
+        max_shared_memory_per_sm=getattr(props, "max_shared_memory_per_block", 0),
+        sm_features=sm_features,
+        runtime_features=runtime_features,
+        interconnect=interconnect,
+        numa_cpu_affinity=numa_cpu_affinity,
+    )
+
+
+def _get_cuda_sm_features(arch_version: ArchVersion) -> frozenset[str]:
+    """Determine CUDA SM features from arch version."""
+    features: set[str] = set()
+
+    if arch_version >= ArchVersion(7, 0):
+        features |= {"tensor_core:f16"}
+
+    if arch_version >= ArchVersion(8, 0):
+        features |= {"tensor_core:int8", "memory:async_copy"}
+
+    if arch_version >= ArchVersion(8, 9):
+        features |= {"tensor_core:f8"}
+
+    if arch_version >= ArchVersion(9, 0):
+        features |= {"memory:tma", "compute:cluster"}
+
+    if arch_version >= ArchVersion(10, 0):
+        features |= {"tensor_core:f4"}
+
+    return frozenset(features)
+
+
+def _get_cuda_runtime_features() -> frozenset[str]:
+    """Detect CUDA runtime features from environment."""
+    features: set[str] = {"runtime:cuda_graph"}
+
+    if _check_symmetric_memory_available():
+        features.add("comms:symmetric_memory")
+    if _check_nvlink_available():
+        features.add("comms:nvlink")
+    if _detect_cuda_nvlink_topology() == "nvlink_full":
+        features.add("comms:nvlink_full")
+
+    return frozenset(features)
+
+
+def _detect_rocm_platform() -> PlatformInfo:
+    """Detect AMD ROCm platform."""
+    import torch
+
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    arch = _extract_amd_arch(props.gcnArchName)
+
+    # Map supported AMD architectures.
+    arch_map = {
+        "gfx950": ArchVersion(9, 5),  # MI350
+        "gfx1201": ArchVersion(12, 0),  # RDNA4
+        "gfx1250": ArchVersion(12, 5),
+    }
+    try:
+        arch_version = arch_map[arch]
+    except KeyError:
+        supported_arches = ", ".join(sorted(arch_map))
+        raise RuntimeError(
+            f"Detected unsupported AMD GPU architecture {arch!r}; "
+            f"current support list: {supported_arches}"
+        ) from None
+    sm_features = _get_rocm_sm_features(arch)
+    runtime_features = _get_rocm_runtime_features()
+
+    return PlatformInfo(
+        vendor="amd",
+        arch_version=arch_version,
+        device_name=props.name,
+        device_count=torch.cuda.device_count(),
+        total_memory=props.total_memory,
+        memory_bandwidth=_estimate_amd_bandwidth(props),
+        sm_count=props.multi_processor_count,
+        max_threads_per_sm=getattr(props, "max_threads_per_multi_processor", 0),
+        max_shared_memory_per_sm={
+            "gfx950": 160 * 1024,
+        }.get(arch, getattr(props, "max_shared_memory_per_block", 0)),
+        sm_features=sm_features,
+        runtime_features=runtime_features,
+        interconnect=_detect_rocm_interconnect(),
+    )
+
+
+def _get_rocm_sm_features(arch: str) -> frozenset[str]:
+    """Determine ROCm SM features from architecture."""
+    # gfx1201 uses portable kernels. Do not advertise CDNA matrix/async-copy
+    # capabilities until the corresponding implementations support RDNA4.
+    features: set[str] = set()
+
+    if arch in ("gfx950", "gfx1250"):
+        features |= {"tensor_core:f16", "tensor_core:f8"}
+
+    if arch in ("gfx950", "gfx1250"):
+        features |= {"tensor_core:f4", "memory:async_copy"}
+
+    return frozenset(features)
+
+
+def _get_rocm_runtime_features() -> frozenset[str]:
+    """Detect ROCm runtime features from environment."""
+    features: set[str] = set()
+
+    if _check_symmetric_memory_available():
+        features.add("comms:symmetric_memory")
+
+    return frozenset(features)
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+
+def _extract_amd_arch(gcn_arch_name: str) -> str:
+    """Extract base architecture from GCN arch name.
+
+    Example: 'gfx950:sramecc+:xnack-' -> 'gfx950'
+    """
+    return gcn_arch_name.split(":")[0]
+
+
+def _estimate_bandwidth(props: object) -> float:
+    """Estimate memory bandwidth in GB/s from CUDA device properties."""
+    clock_rate = getattr(props, "memory_clock_rate", 0)
+    bus_width = getattr(props, "memory_bus_width", 0)
+    if clock_rate and bus_width:
+        return (clock_rate * 1e3 * (bus_width / 8) * 2) / 1e9
+    return 0.0
+
+
+def _estimate_amd_bandwidth(props: object) -> float:
+    """Estimate memory bandwidth for AMD devices."""
+    clock_rate = getattr(props, "memory_clock_rate", 0)
+    bus_width = getattr(props, "memory_bus_width", 0)
+    if clock_rate and bus_width:
+        return (clock_rate * 1e3 * (bus_width / 8) * 2) / 1e9
+    return 0.0
+
+
+def _detect_cuda_interconnect() -> InterconnectInfo | None:
+    """Detect CUDA multi-GPU interconnect topology."""
+    try:
+        import torch
+
+        device_count = torch.cuda.device_count()
+        if device_count <= 1:
+            return InterconnectInfo(topology="single_gpu")
+
+        nvlink_topology = _detect_cuda_nvlink_topology()
+        if nvlink_topology:
+            return InterconnectInfo(topology=nvlink_topology)
+        return InterconnectInfo(topology="pcie")
+    except Exception:
+        return None
+
+
+def _detect_rocm_interconnect() -> InterconnectInfo | None:
+    """Detect ROCm multi-GPU interconnect topology."""
+    try:
+        import torch
+
+        device_count = torch.cuda.device_count()
+        if device_count <= 1:
+            return InterconnectInfo(topology="single_gpu")
+        # Probe /sys/class/kfd for xGMI links (HSA_IOLINK_TYPE_XGMI = 11).
+        try:
+            import os as _os
+
+            kfd_root = "/sys/class/kfd/kfd/topology/nodes"
+            xgmi_count = 0
+            for node in _os.listdir(kfd_root):
+                links_dir = _os.path.join(kfd_root, node, "io_links")
+                if not _os.path.isdir(links_dir):
+                    continue
+                for link in _os.listdir(links_dir):
+                    pf = _os.path.join(links_dir, link, "properties")
+                    try:
+                        with open(pf) as f:
+                            for line in f:
+                                if line.startswith("type ") and line.split()[1] == "11":
+                                    xgmi_count += 1
+                    except OSError:
+                        continue
+            if xgmi_count > 0:
+                full = device_count * (device_count - 1)
+                topo = "xgmi_full" if xgmi_count >= full else "xgmi_pairs"
+                return InterconnectInfo(topology=topo)
+        except Exception:
+            pass
+        return InterconnectInfo(topology="pcie")
+    except Exception:
+        return None
+
+
+def _detect_cuda_numa_cpu_affinity() -> tuple[tuple[int, ...], ...]:
+    """Return NUMA-local CPU IDs per visible CUDA device using NVML."""
+    nvml_initialized = False
+    try:
+        import pynvml
+
+        device_count = torch.cuda.device_count()
+        if device_count == 0:
+            return ()
+
+        pynvml.nvmlInit()
+        nvml_initialized = True
+
+        c_ulong_bits = ctypes.sizeof(ctypes.c_ulong) * 8
+        cpu_count = os.cpu_count()
+        if not cpu_count:
+            return ()
+
+        affinities: list[tuple[int, ...]] = []
+        for device_id in range(device_count):
+            props = torch.cuda.get_device_properties(device_id)
+            pci_bus_id = (
+                f"{props.pci_domain_id:08X}:{props.pci_bus_id:02X}:"
+                f"{props.pci_device_id:02X}.0"
+            )
+            handle = pynvml.nvmlDeviceGetHandleByPciBusId(pci_bus_id)
+            masks = pynvml.nvmlDeviceGetCpuAffinity(
+                handle, math.ceil(cpu_count / c_ulong_bits)
+            )
+            affinities.append(
+                tuple(
+                    cpu
+                    for cpu in range(cpu_count)
+                    if masks[cpu // c_ulong_bits] & (1 << (cpu % c_ulong_bits))
+                )
+            )
+    except Exception as e:
+        logger.warning(f"NVML failed to query NUMA affinity: {e!s}")
+        return ()
+    finally:
+        if nvml_initialized:
+            pynvml.nvmlShutdown()
+
+    return tuple(affinities)
+
+
+@lru_cache(maxsize=1)
+def _detect_cuda_nvlink_topology() -> str | None:
+    """Return NVLink topology for visible CUDA devices using NVML."""
+    nvml_initialized = False
+    try:
+        import pynvml
+
+        device_count = torch.cuda.device_count()
+        if device_count <= 1:
+            return None
+
+        pynvml.nvmlInit()
+        nvml_initialized = True
+
+        handles = []
+        for device_id in range(device_count):
+            props = torch.cuda.get_device_properties(device_id)
+            pci_bus_id = (
+                f"{props.pci_domain_id:08X}:{props.pci_bus_id:02X}:"
+                f"{props.pci_device_id:02X}.0"
+            )
+            handles.append(pynvml.nvmlDeviceGetHandleByPciBusId(pci_bus_id))
+
+        has_nvlink = False
+        full_nvlink = True
+        for i, handle in enumerate(handles):
+            for j, peer_handle in enumerate(handles):
+                if i >= j:
+                    continue
+                try:
+                    p2p_status = pynvml.nvmlDeviceGetP2PStatus(
+                        handle, peer_handle, pynvml.NVML_P2P_CAPS_INDEX_NVLINK
+                    )
+                    if p2p_status == pynvml.NVML_P2P_STATUS_OK:
+                        has_nvlink = True
+                    else:
+                        full_nvlink = False
+                except pynvml.NVMLError:
+                    full_nvlink = False
+    except Exception as e:
+        logger.warning(f"NVML failed to query NVLink topology: {e!s}")
+        return None
+    finally:
+        if nvml_initialized:
+            pynvml.nvmlShutdown()
+
+    if full_nvlink:
+        return "nvlink_full"
+    if has_nvlink:
+        return "nvlink_pairs"
+    return None
+
+
+def _check_symmetric_memory_available() -> bool:
+    """Check if PyTorch symmetric memory is available."""
+    try:
+        import torch.distributed._symmetric_memory  # noqa: F401
+
+        return True
+    except (ImportError, AttributeError):
+        return False
+
+
+def _check_nvlink_available() -> bool:
+    """Check if NVLink connectivity is available."""
+    return _detect_cuda_nvlink_topology() is not None
+
+
+@lru_cache(maxsize=1)
+def _get_hip_runtime():
+    lib_name = "libamdhip64.so"
+    candidates = []
+    torch_hip_path = Path(torch.__file__).resolve().parent / "lib" / lib_name
+    if torch_hip_path.exists():
+        candidates.append(str(torch_hip_path))
+    candidates.append(lib_name)
+
+    last_error = None
+    for candidate in candidates:
+        try:
+            lib = ctypes.CDLL(candidate)
+            lib.hipHostGetDevicePointer.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_void_p,
+                ctypes.c_uint,
+            ]
+            lib.hipHostGetDevicePointer.restype = ctypes.c_int
+            if hasattr(lib, "hipGetErrorString"):
+                lib.hipGetErrorString.argtypes = [ctypes.c_int]
+                lib.hipGetErrorString.restype = ctypes.c_char_p
+            return lib
+        except OSError as exc:
+            last_error = exc
+
+    raise RuntimeError(f"Failed to load {lib_name}") from last_error
+
+
+def _hip_host_get_device_pointer(host_ptr: int) -> int:
+    lib = _get_hip_runtime()
+    device_ptr = ctypes.c_void_p()
+    error = lib.hipHostGetDevicePointer(
+        ctypes.byref(device_ptr), ctypes.c_void_p(host_ptr), 0
+    )
+    if error != 0:
+        error_str = f"HIP error {error}"
+        if hasattr(lib, "hipGetErrorString"):
+            raw_error_str = lib.hipGetErrorString(error)
+            if raw_error_str:
+                error_str = raw_error_str.decode()
+        raise RuntimeError(
+            "hipHostGetDevicePointer failed for registered host pointer "
+            f"0x{host_ptr:x}: {error_str}"
+        )
+    if device_ptr.value is None:
+        raise RuntimeError(
+            f"hipHostGetDevicePointer returned null for registered host pointer 0x{host_ptr:x}"
+        )
+    return device_ptr.value

@@ -1,0 +1,85 @@
+Metadata-Version: 2.4
+Name: tokenspeed
+Version: 0.1.1
+Summary: TokenSpeed is a speed-of-light LLM inference engine.
+License: MIT License
+        
+        Copyright (c) 2026 LightSeek Foundation <contact@lightseek.org>
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+        
+Project-URL: Homepage, https://github.com/lightseekorg/tokenspeed
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE
+License-File: THIRDPARTYNOTICES
+Requires-Dist: aiohttp
+Requires-Dist: compressed-tensors
+Requires-Dist: dill
+Requires-Dist: einops
+Requires-Dist: fastapi
+Requires-Dist: grpcio-health-checking==1.81.1
+Requires-Dist: grpcio-reflection==1.81.1
+Requires-Dist: hf_transfer
+Requires-Dist: huggingface_hub
+Requires-Dist: modelscope
+Requires-Dist: msgspec
+Requires-Dist: ninja
+Requires-Dist: numpy
+Requires-Dist: openai>=2.24.1
+Requires-Dist: openai-harmony
+Requires-Dist: orjson
+Requires-Dist: packaging
+Requires-Dist: partial-json-parser
+Requires-Dist: peft
+Requires-Dist: pillow
+Requires-Dist: prometheus-client
+Requires-Dist: psutil
+Requires-Dist: pybase64
+Requires-Dist: pybind11
+Requires-Dist: pydantic
+Requires-Dist: py-spy
+Requires-Dist: pytest>=9
+Requires-Dist: pytest-asyncio
+Requires-Dist: python-multipart
+Requires-Dist: pyzmq
+Requires-Dist: requests
+Requires-Dist: setproctitle
+Requires-Dist: tiktoken
+Requires-Dist: torch
+Requires-Dist: torchvision
+Requires-Dist: tokenspeed-kernel>=0.1.4.dev0
+Requires-Dist: tokenspeed-mooncake>=0.3.13.post20260929
+Requires-Dist: tokenspeed-scheduler>=0.1.41
+Requires-Dist: tokenspeed-smg==1.13.0.post20261019
+Requires-Dist: tokenspeed-smg-grpc-proto==0.4.27.post20261019
+Requires-Dist: tokenspeed-smg-grpc-servicer==0.14.0.post20261019
+Requires-Dist: torch_memory_saver==0.0.9.post1
+Requires-Dist: tqdm
+Requires-Dist: transformers==5.12.0
+Requires-Dist: uv
+Requires-Dist: uvicorn
+Requires-Dist: uvloop
+Requires-Dist: xgrammar==0.2.8
+Requires-Dist: viztracer
+Provides-Extra: instanttensor
+Requires-Dist: instanttensor<0.2,>=0.1.9; extra == "instanttensor"
+Dynamic: license-file

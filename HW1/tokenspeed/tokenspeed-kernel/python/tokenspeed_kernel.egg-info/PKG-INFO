@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: tokenspeed_kernel
+Version: 0.1.4.dev20261022+git00000000
+Requires-Python: >=3.11
+License-File: LICENSE
+License-File: THIRDPARTYNOTICES
+Requires-Dist: packaging
+Requires-Dist: wheel
+Requires-Dist: psutil
+Requires-Dist: numpy
+Requires-Dist: torch
+Requires-Dist: apache-tvm-ffi==0.1.13.post3
+Requires-Dist: triton-ascend==3.2.1
+Dynamic: license-file
+Dynamic: requires-dist

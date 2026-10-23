@@ -1,0 +1,1024 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+import logging
+import os
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Callable, Generator
+
+from tokenspeed_kernel.platform import PlatformInfo, current_platform
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+from tokenspeed_kernel.signature import FormatSignature
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "NoKernelFoundError",
+    "SelectedKernel",
+    "KernelPlan",
+    "SelectionStrategy",
+    "ScoreBreakdown",
+    "SelectionOracle",
+    "AutotuneParams",
+    "SelectionPolicy",
+    "select_kernel",
+    "resolve_kernel_override",
+    "set_selection_policy",
+    "register_oracle",
+    "kernel_override",
+    "explain_selection",
+    "spec_matches_traits",
+    "ref_compatible_with_spec",
+    "spec_matches_shape_traits",
+    "warmup_selection",
+]
+
+
+class NoKernelFoundError(RuntimeError):
+    """Raised when no kernel matches the requested operation."""
+
+    pass
+
+
+class SelectedKernel:
+    """Result of kernel selection — a callable that also carries the kernel name."""
+
+    __slots__ = ("name", "impl")
+
+    def __init__(self, name: str, impl: Callable) -> None:
+        self.name = name
+        self.impl = impl
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.impl(*args, **kwargs)
+
+    # Two selections of the same registered kernel are interchangeable, so the
+    # plans that hold them (KernelPlan, the moe_plan dict) compare by value.
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SelectedKernel):
+            return NotImplemented
+        return (self.name, self.impl) == (other.name, other.impl)
+
+    def __hash__(self) -> int:
+        return hash((self.name, self.impl))
+
+    def __repr__(self) -> str:
+        return f"SelectedKernel(name={self.name!r})"
+
+
+@dataclass(frozen=True)
+class KernelPlan:
+    """An initialization-time selection reused without consulting the registry.
+
+    Static traits describe the call site's geometry and semantics. Variable
+    traits may change at execution, but cannot restrict the selected leaf's
+    applicability. The provider owns invariance across those varying inputs.
+    """
+
+    family: str
+    mode: str
+    signature: FormatSignature
+    static_traits: tuple[tuple[str, Any], ...]
+    spec: KernelSpec
+    kernel: SelectedKernel
+
+    @classmethod
+    def select(
+        cls,
+        family: str,
+        mode: str,
+        signature: FormatSignature,
+        *,
+        features: frozenset[str],
+        static_traits: dict[str, Any],
+        variable_traits: frozenset[str],
+        declared_traits: frozenset[str],
+        solution: str | None,
+        ignore_layout: bool,
+        platform: PlatformInfo | None = None,
+    ) -> KernelPlan:
+        """Select once using static inputs; never tune on a representative batch.
+
+        Variable dimensions must be unrestricted by the leaf. A bounded provider
+        needs a separate, explicitly validated deployment domain before it can be
+        planned here. declared_traits names semantic promises (such as slot
+        order) that must be explicit rather than inferred from an absent trait.
+        Name breaks equal-priority ties independently of import order.
+        """
+        if not declared_traits <= static_traits.keys():
+            raise ValueError("Declared traits must also have static requirements")
+        if variable_traits.intersection(static_traits):
+            raise ValueError("A planning trait cannot be both static and variable")
+        platform = platform or current_platform()
+        registry = KernelRegistry.get()
+        candidates = registry.get_for_operator(
+            family,
+            mode,
+            features=features,
+            platform=platform,
+            format_signature=signature,
+            solution=solution,
+            ignore_layout=ignore_layout,
+        )
+        candidates = [
+            spec
+            for spec in candidates
+            if not any(
+                variable in spec.traits
+                or any(
+                    f"{variable}{suffix}" in spec.traits
+                    for suffix, _ in _BOUND_SUFFIXES
+                )
+                for variable in variable_traits
+            )
+        ]
+        candidates = [
+            spec
+            for spec in _filter_by_traits(candidates, static_traits)
+            if declared_traits <= spec.traits.keys()
+        ]
+        override = resolve_kernel_override(family, mode, None)
+        if override is not None:
+            candidates = [
+                spec for spec in candidates if override in (spec.name, spec.solution)
+            ]
+        if not candidates:
+            raise NoKernelFoundError(
+                f"No initialization-time kernel for {family}.{mode} with features "
+                f"{sorted(features)}, static traits {static_traits} and unrestricted "
+                f"variable traits {sorted(variable_traits)} on {platform.device_name}"
+            )
+        scored = _rank(
+            sorted(candidates, key=lambda spec: spec.name), platform, static_traits
+        )
+        winner = scored[0][0]
+        _log_selection(family, mode, signature, winner, scored, platform)
+        return cls(
+            family,
+            mode,
+            signature,
+            tuple(static_traits.items()),
+            winner,
+            SelectedKernel(winner.name, registry.get_impl(winner.name)),
+        )
+
+    def validate(
+        self,
+        family: str,
+        mode: str,
+        signature: FormatSignature,
+        traits: dict[str, Any] | None,
+        features: frozenset[str] | None,
+        solution: str | None,
+        override: str | None,
+    ) -> None:
+        """Check inputs against the saved choice, without consulting the registry."""
+        override = resolve_kernel_override(family, mode, override)
+        if (family, mode, signature) != (self.family, self.mode, self.signature):
+            raise ValueError(
+                f"Input contract changed for planned kernel {self.kernel.name}"
+            )
+        if solution is not None and solution != self.spec.solution:
+            raise ValueError("A kernel plan cannot change solution during execution")
+        if override is not None and override not in (
+            self.spec.name,
+            self.spec.solution,
+        ):
+            raise ValueError("A kernel plan cannot change override during execution")
+        if features and not features <= self.spec.features:
+            raise ValueError("Planned kernel does not provide the requested features")
+        actual = traits or {}
+        for name, value in self.static_traits:
+            if not (
+                _trait_value_matches(value, actual.get(name))
+                if isinstance(value, frozenset)
+                else actual.get(name) == value
+            ):
+                raise ValueError(
+                    f"Planned kernel {self.kernel.name}: static trait {name} changed"
+                )
+        if not spec_matches_traits(self.spec, actual) or not spec_matches_shape_traits(
+            self.spec, actual
+        ):
+            raise ValueError(
+                f"Input is outside planned kernel {self.kernel.name}'s domain"
+            )
+
+
+class SelectionStrategy(Enum):
+    HEURISTIC = "heuristic"  # Score-based ranking (default, instant)
+    AUTOTUNE = "autotune"  # Benchmark candidates, pick fastest
+
+
+@dataclass
+class ScoreBreakdown:
+    """Per-kernel scoring breakdown across all dimensions.
+
+    Ranking is lexicographic on ``(oracle, priority)`` — the oracle's
+    per-family knowledge wins first, with the kernel's declared priority band
+    as the tiebreaker.
+    """
+
+    priority: int  # [0, 20) — from KernelSpec.priority
+    oracle: int  # [0, 20) — per-family oracle adjustment
+
+    def sort_key(self) -> tuple[int, int]:
+        """Lex sort key (descending — higher is better)."""
+        return (self.oracle, self.priority)
+
+    def __str__(self) -> str:
+        return f"ora={self.oracle} pri={self.priority}"
+
+
+class SelectionOracle:
+    """Base class for per-family selection adjustments.
+
+    Return a score in [0, 20). 10 = neutral. Higher = better fit.
+    """
+
+    def adjust(
+        self,
+        spec: KernelSpec,
+        platform: PlatformInfo,
+        traits: dict[str, Any] | None,
+    ) -> int:
+        return 10
+
+
+@dataclass
+class AutotuneParams:
+    """Tuning knobs for autotune strategy."""
+
+    warmup_iters: int = 3
+    bench_iters: int = 10
+    use_cuda_events: bool = True
+
+
+@dataclass
+class SelectionPolicy:
+    """Per-op selection strategy configuration."""
+
+    # Default strategy for all ops
+    default_strategy: SelectionStrategy = SelectionStrategy.HEURISTIC
+
+    # Per-op overrides: (family, mode) -> strategy
+    op_strategies: dict[tuple[str, str], SelectionStrategy] = field(
+        default_factory=dict
+    )
+
+    # Autotune parameters (used when strategy is AUTOTUNE)
+    autotune_params: AutotuneParams = field(default_factory=AutotuneParams)
+
+    def get_strategy(self, family: str, mode: str) -> SelectionStrategy:
+        return self.op_strategies.get((family, mode), self.default_strategy)
+
+
+_policy = SelectionPolicy()
+_oracles: dict[str, SelectionOracle] = {}
+_global_overrides: dict[tuple[str, str], str] = {}
+# (family, mode, kernel name) triples whose override selection has already been
+# logged in this process. The override path bypasses the selection cache, so
+# without this the verbose log would repeat on every call.
+_logged_overrides: set[tuple[str, str, str]] = set()
+
+
+def set_selection_policy(policy: SelectionPolicy) -> None:
+    """Set per-op selection strategy. Clears all cached selections."""
+    global _policy
+    _policy = policy
+    KernelRegistry.get().clear_cache()
+
+
+def register_oracle(family: str, oracle: SelectionOracle) -> None:
+    """Register a per-family selection oracle."""
+    _oracles[family] = oracle
+
+
+def _get_oracle(family: str) -> SelectionOracle | None:
+    return _oracles.get(family)
+
+
+def _make_cache_key(
+    family: str,
+    mode: str,
+    format_signature: FormatSignature,
+    arch: str,
+    features: frozenset[str] | None,
+    traits: dict[str, Any] | None,
+    solution: str | None = None,
+    ignore_layout: bool = False,
+) -> tuple:
+    """Build a hashable cache key including selection-relevant traits."""
+    traits_key = tuple(sorted(traits.items())) if traits else ()
+    mods_key = frozenset(features) if features else frozenset()
+    return (
+        family,
+        mode,
+        format_signature,
+        arch,
+        mods_key,
+        traits_key,
+        solution,
+        ignore_layout,
+    )
+
+
+def _score_priority(spec: KernelSpec) -> int:
+    """Priority dimension: kernel's inherent quality/maturity."""
+    return max(0, min(19, spec.priority))
+
+
+def _score_oracle(
+    spec: KernelSpec,
+    platform: PlatformInfo,
+    traits: dict[str, Any] | None,
+) -> int:
+    """Oracle dimension: per-family domain-specific scoring."""
+    oracle = _get_oracle(spec.family)
+    if oracle is None:
+        return 10  # Neutral when no oracle is registered
+    score = oracle.adjust(spec, platform, traits)
+    return max(0, min(19, score))
+
+
+def _score(
+    spec: KernelSpec,
+    platform: PlatformInfo,
+    traits: dict[str, Any] | None,
+) -> ScoreBreakdown:
+    """Score a kernel across all ranking dimensions."""
+    return ScoreBreakdown(
+        priority=_score_priority(spec),
+        oracle=_score_oracle(spec, platform, traits),
+    )
+
+
+def _rank(
+    specs: list[KernelSpec],
+    platform: PlatformInfo,
+    traits: dict[str, Any] | None,
+) -> list[tuple[KernelSpec, ScoreBreakdown]]:
+    """Rank kernels lexicographically by (oracle, priority).
+
+    Higher is better. Oracle wins first because per-family oracles encode the
+    most domain knowledge; the kernel's declared priority band is the
+    tiebreaker.
+    """
+    scored = [(spec, _score(spec, platform, traits)) for spec in specs]
+    scored.sort(key=lambda x: x[1].sort_key(), reverse=True)
+    return scored
+
+
+def _trait_value_matches(spec_values: frozenset[Any], trait_value: Any) -> bool:
+    if not isinstance(trait_value, (set, frozenset)):
+        trait_value = frozenset({trait_value})
+    return trait_value.issubset(spec_values)
+
+
+# MoE size traits a kernel may constrain either exactly (``<name>`` lists the
+# accepted sizes) or by divisibility (``<name>_alignment`` lists accepted
+# multiples). ``ispp`` is the intermediate size per partition; ``hidden`` the
+# MoE input width. Both are geometry a kernel's weight layout may reject, so
+# they must veto selection rather than fail later in weight preprocessing.
+_ALIGNED_SIZE_TRAITS = {
+    "ispp": "ispp_alignment",
+    "hidden": "hidden_alignment",
+}
+
+
+def _size_satisfies_alignment(spec: KernelSpec, name: str, size: Any) -> bool:
+    try:
+        size_value = int(size)
+    except (TypeError, ValueError):
+        return False
+    exact_sizes = spec.traits.get(name)
+    if exact_sizes is not None and size_value not in exact_sizes:
+        return False
+    alignments = spec.traits.get(_ALIGNED_SIZE_TRAITS[name])
+    if alignments is None:
+        return True
+    return any(
+        int(alignment) > 0 and size_value % int(alignment) == 0
+        for alignment in alignments
+    )
+
+
+def spec_matches_traits(
+    spec: KernelSpec,
+    traits: dict[str, Any],
+    *,
+    require_all_traits: bool = False,
+) -> bool:
+    """Return whether a spec's declared traits match the requested traits.
+
+    Args:
+        spec: Registered kernel specification to test.
+        traits: Trait requirements. Values may be concrete scalars (for example,
+            ``{"head_dim": 128}``) or sets/frozensets of allowed values.
+        require_all_traits: When ``False`` (selection behavior), unknown traits on
+            the spec are ignored. When ``True`` (reference compatibility checks),
+            every requested trait must be explicitly present on the spec.
+    """
+    # Size traits (see _ALIGNED_SIZE_TRAITS) match against the kernel's
+    # declared exact sizes and supported alignments (if any), so a MoE kernel
+    # whose weight layout cannot take the layer's geometry is never selected.
+    # A kernel pinned to exact sizes needs the request to state the size.
+    for size_name in _ALIGNED_SIZE_TRAITS:
+        if size_name in spec.traits and size_name not in traits:
+            return False
+    for trait_name, trait_value in traits.items():
+        if trait_name in _ALIGNED_SIZE_TRAITS:
+            if not _size_satisfies_alignment(spec, trait_name, trait_value):
+                return False
+            continue
+
+        spec_values = spec.traits.get(trait_name)
+        if spec_values is None:
+            if require_all_traits:
+                return False
+            continue
+        if not _trait_value_matches(spec_values, trait_value):
+            return False
+    return True
+
+
+def ref_compatible_with_spec(ref: KernelSpec, spec: KernelSpec) -> bool:
+    """Return whether a reference kernel can handle the same inputs as a test kernel.
+
+    For each trait the reference declares, the spec must declare that same trait
+    with values that fully cover the reference's required values.  Traits the
+    reference does not declare are unconstrained (the reference is general with
+    respect to those traits).
+    """
+    for trait_name, ref_values in ref.traits.items():
+        spec_values = spec.traits.get(trait_name)
+        if spec_values is None:
+            return False
+        if not ref_values.issubset(spec_values):
+            return False
+    return True
+
+
+# GEMM problem-shape dimensions. Their exact value sets are enforced here as
+# well as by ``spec_matches_traits`` so that shape-only callers (numerics,
+# benchmarks) see the full envelope, and a spec that constrains one of them
+# rejects a request that omits it.
+_SHAPE_DIMS: tuple[str, ...] = ("batch", "m", "n", "k")
+
+# Suffixes that turn a dimension trait ``<dim>`` into a bound on a spec.
+_BOUND_SUFFIXES: tuple[tuple[str, Callable[[int, int], bool]], ...] = (
+    ("_align", lambda value, alignment: value % alignment == 0),
+    ("_min", lambda value, minimum: value >= minimum),
+    ("_max", lambda value, maximum: value <= maximum),
+)
+
+
+def spec_matches_shape_traits(spec: KernelSpec, traits: dict[str, Any]) -> bool:
+    """Return whether a spec's problem-shape traits accept the requested shape.
+
+    A request describes its shape with integer traits such as ``m``, ``k`` or
+    ``batch_size``. For any such dimension ``<dim>`` a spec may declare:
+
+    * ``<dim>``: the exact supported values.
+    * ``<dim>_align``: the value must be a multiple of one declared alignment.
+    * ``<dim>_min``: the value must reach one declared minimum.
+    * ``<dim>_max``: the value must not exceed one declared maximum.
+
+    Rules those cannot express go in ``mnk_problem_filter``, a set of
+    ``(m, n, k) -> bool`` predicates of which at least one must accept.
+
+    A declared bound is a hard requirement: a spec that declares
+    ``<dim>_align``, ``<dim>_min`` or ``<dim>_max`` rejects any request that
+    does not supply ``<dim>``, and a ``mnk_problem_filter`` rejects a request
+    missing any of ``m``, ``n`` or ``k``. Exact sets are matched by value
+    membership; for the GEMM dimensions ``batch``, ``m``, ``n`` and ``k`` that
+    is also enforced here and a spec constraining one of them rejects a request
+    that omits it. Dimensions a spec does not constrain are ignored.
+
+    By convention a trait dict lists the shape traits first, each ``_align``,
+    ``_min`` and ``_max`` bound right after the dimension it bounds and
+    ``mnk_problem_filter`` last, followed by the remaining traits in
+    alphabetical order.
+    """
+    for trait_name, bounds in spec.traits.items():
+        for suffix, satisfies in _BOUND_SUFFIXES:
+            if not trait_name.endswith(suffix):
+                continue
+            value = traits.get(trait_name[: -len(suffix)])
+            if not isinstance(value, int):
+                return False
+            if not any(satisfies(value, bound) for bound in bounds):
+                return False
+
+    for dim in _SHAPE_DIMS:
+        exact = spec.traits.get(dim)
+        if exact is None:
+            continue
+        value = traits.get(dim)
+        if not isinstance(value, int) or value not in exact:
+            return False
+
+    problem_filters = spec.traits.get("mnk_problem_filter")
+    if problem_filters is not None:
+        m, n, k = traits.get("m"), traits.get("n"), traits.get("k")
+        if not all(isinstance(dim, int) for dim in (m, n, k)):
+            return False
+        if not any(problem_filter(m, n, k) for problem_filter in problem_filters):
+            return False
+
+    return True
+
+
+def _filter_by_traits(
+    specs: list[KernelSpec],
+    traits: dict[str, Any],
+) -> list[KernelSpec]:
+    """Filter kernels by op-specific trait compatibility."""
+    return [
+        spec
+        for spec in specs
+        if spec_matches_traits(spec, traits) and spec_matches_shape_traits(spec, traits)
+    ]
+
+
+def _resolve_override(
+    registry: KernelRegistry,
+    family: str,
+    mode: str,
+    format_signature: object,
+    override: str,
+    platform: PlatformInfo,
+    features: frozenset[str] | None,
+) -> SelectedKernel:
+    """Resolve a kernel name or solution forced by ``override``.
+
+    An override skips platform, format-signature and trait matching, but not
+    the operator's required ``features``: a feature names a keyword or
+    behaviour the facade relies on (the kernel's launcher takes it), so a
+    kernel without it would fail inside the leaf, not at selection. A kernel
+    lacking one is refused here with the feature named.
+    """
+    spec = registry.get_by_name(override)
+    if spec is None:
+        candidates = registry.get_for_operator(family, mode, solution=override)
+        if not candidates:
+            raise NoKernelFoundError(
+                f"Override '{override}' not found for {family}.{mode} "
+                f"({format_signature})"
+            )
+        # The solution's highest-priority kernel declaring every required
+        # feature; without one, its first kernel names the refusal below.
+        spec = next(
+            (s for s in candidates if features is None or features <= s.features),
+            candidates[0],
+        )
+    if features is not None and not features <= spec.features:
+        missing = sorted(features - spec.features)
+        raise NoKernelFoundError(
+            f"Override '{override}' resolves to {spec.name!r} for {family}.{mode} "
+            f"({format_signature}), which does not declare the required "
+            f"feature(s) {missing}"
+        )
+    return SelectedKernel(name=spec.name, impl=registry.get_impl(spec.name))
+
+
+def _log_selection(
+    family: str,
+    mode: str,
+    format_signature: object,
+    winner: KernelSpec,
+    scored: list[tuple[KernelSpec, ScoreBreakdown]],
+    platform: PlatformInfo,
+) -> None:
+    """Log selection result if verbose mode is enabled."""
+    if not os.environ.get("TOKENSPEED_KERNEL_VERBOSE"):
+        return
+
+    breakdown = next((s for spec, s in scored if spec.name == winner.name), None)
+    if breakdown:
+        logger.info(
+            f"[tokenspeed_kernel] {family!s}.{mode!s}({format_signature!s}) -> "
+            f"{winner.name!s} ({breakdown!s}, {platform.arch!s})",
+        )
+    else:
+        logger.info(
+            f"[tokenspeed_kernel] {family!s}.{mode!s}({format_signature!s}) -> "
+            f"{winner.name!s} ({platform.arch!s})",
+        )
+
+
+def _log_override_selection(
+    family: str,
+    mode: str,
+    format_signature: object,
+    selected: SelectedKernel,
+    override: str,
+    platform: PlatformInfo,
+) -> None:
+    """Log an override-resolved selection if verbose mode is enabled, once per
+    (family, mode, kernel) per process."""
+    if not os.environ.get("TOKENSPEED_KERNEL_VERBOSE"):
+        return
+    key = (family, mode, selected.name)
+    if key in _logged_overrides:
+        return
+    _logged_overrides.add(key)
+    logger.info(
+        f"[tokenspeed_kernel] {family!s}.{mode!s}({format_signature!s}) -> "
+        f"{selected.name!s} (override {override!s}, {platform.arch!s})",
+    )
+
+
+def _override_env_key(family: str, mode: str) -> str:
+    return f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
+
+
+def resolve_kernel_override(family: str, mode: str, override: str | None) -> str | None:
+    """Resolve the effective kernel name for family/mode, or return None.
+
+    The environment takes precedence over the context manager and call-site
+    override. Dispatch shortcuts must use this before consulting tuned routes.
+    """
+    env_key = _override_env_key(family, mode)
+    return os.environ.get(env_key) or _global_overrides.get((family, mode)) or override
+
+
+def _override_origin(family: str, mode: str) -> str:
+    """Name the source :func:`resolve_kernel_override` takes its target from,
+    following the same precedence; call only when that target is set."""
+    env_key = _override_env_key(family, mode)
+    if os.environ.get(env_key):
+        return f"env {env_key}"
+    if _global_overrides.get((family, mode)):
+        return "kernel_override()"
+    return "explicit override= argument"
+
+
+def select_kernel(
+    family: str,
+    mode: str,
+    format_signature: FormatSignature,
+    *,
+    features: frozenset[str] | None = None,
+    platform: PlatformInfo | None = None,
+    traits: dict[str, Any] | None = None,
+    solution: str | None = None,
+    override: str | None = None,
+    ignore_layout: bool = False,
+) -> SelectedKernel:
+    """Select the best kernel for an operation.
+
+    On first call for a given (family, mode, format_signature, platform, traits,
+    solution) combination, runs the full selection pipeline. Subsequent calls
+    with the same arguments return the cached result — a single dict lookup.
+
+    Args:
+        family: Operator family (e.g., "attention")
+        mode: Operator mode (e.g., "decode")
+        format_signature: Role-indexed tensor format signature
+        features: Required operator features (e.g., {"paged"})
+        platform: Hardware to match (auto-detected if None)
+        traits: Op-specific trait values that affect kernel applicability
+               (e.g., {"head_dim": 128, "num_kv_heads": 8})
+        solution: Restrict selection to a registered solution while preserving
+            normal platform, format signature, and trait filtering.
+        override: Force a specific kernel name or solution string, skipping
+            platform, format-signature and trait matching but still refusing
+            a kernel that lacks a required feature.
+        ignore_layout: Ignore only storage layouts when choosing preprocessing
+            at initialization. Execution uses the default layout-aware matching.
+
+    Returns:
+        A :class:`SelectedKernel` that is directly callable and also
+        exposes the winning kernel's ``name``.
+
+    Under ``TOKENSPEED_KERNEL_VERBOSE`` a ranked selection is logged on each
+    cache miss and an override selection once per (family, mode, kernel) per
+    process.
+    """
+    platform = platform or current_platform()
+
+    override = resolve_kernel_override(family, mode, override)
+    registry = KernelRegistry.get()
+
+    # Fast path: check cache (skipped when override is active)
+    cache_key = _make_cache_key(
+        family,
+        mode,
+        format_signature,
+        platform.arch,
+        features,
+        traits,
+        solution,
+        ignore_layout,
+    )
+    if override is None:
+        cached = registry.cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+    if override:
+        selected = _resolve_override(
+            registry, family, mode, format_signature, override, platform, features
+        )
+        _log_override_selection(
+            family, mode, format_signature, selected, override, platform
+        )
+        return selected
+
+    # Get candidates (same filtering for both strategies)
+    candidates = registry.get_for_operator(
+        family,
+        mode,
+        features=features,
+        platform=platform,
+        format_signature=format_signature,
+        solution=solution,
+        ignore_layout=ignore_layout,
+    )
+
+    solution_clause = f" with solution {solution!r}" if solution else ""
+    if not candidates:
+        raise NoKernelFoundError(
+            f"No kernel found for {family}.{mode} ({format_signature})"
+            f"{solution_clause} on {platform.device_name}"
+        )
+
+    if traits:
+        candidates = _filter_by_traits(candidates, traits)
+
+    if not candidates:
+        raise NoKernelFoundError(
+            f"No kernel found for {family}.{mode} ({format_signature})"
+            f"{solution_clause} with traits {traits} on {platform.device_name}"
+        )
+
+    # Strategy dispatch
+    strategy = _policy.get_strategy(family, mode)
+
+    if strategy == SelectionStrategy.AUTOTUNE:
+        winner, scored = _autotune_select(
+            candidates,
+            family,
+            mode,
+            format_signature,
+            platform,
+            traits,
+            _policy.autotune_params,
+        )
+    else:
+        scored = _rank(candidates, platform, traits)
+        winner = scored[0][0]
+
+    _log_selection(family, mode, format_signature, winner, scored, platform)
+
+    impl = registry.get_impl(winner.name)
+    result = SelectedKernel(name=winner.name, impl=impl)
+    registry.cache_put(cache_key, result)
+    return result
+
+
+def _autotune_select(
+    candidates: list[KernelSpec],
+    family: str,
+    mode: str,
+    format_signature: object,
+    platform: PlatformInfo,
+    traits: dict[str, Any] | None,
+    params: AutotuneParams,
+) -> tuple[KernelSpec, list[tuple[KernelSpec, ScoreBreakdown]]]:
+    """Benchmark candidates and return the fastest.
+
+    Falls back to heuristic ranking when the autotuning infrastructure
+    (input generators, benchmark runner) is not yet available.
+    """
+    scored = _rank(candidates, platform, traits)
+    winner = scored[0][0]
+    logger.debug(
+        f"[tokenspeed_kernel:autotune] falling back to heuristic for {family!s}."
+        f"{mode!s}({format_signature!s})",
+    )
+    return winner, scored
+
+
+@contextmanager
+def kernel_override(
+    family: str, mode: str, kernel_name: str
+) -> Generator[None, None, None]:
+    """Context manager for scoped kernel override."""
+    key = (family, mode)
+    old = _global_overrides.get(key)
+    _global_overrides[key] = kernel_name
+    try:
+        yield
+    finally:
+        if old is None:
+            _global_overrides.pop(key, None)
+        else:
+            _global_overrides[key] = old
+
+
+def explain_selection(
+    family: str,
+    mode: str,
+    format_signature: FormatSignature,
+    *,
+    features: frozenset[str] | None = None,
+    platform: PlatformInfo | None = None,
+    traits: dict[str, Any] | None = None,
+    solution: str | None = None,
+    override: str | None = None,
+) -> str:
+    """Return a human-readable explanation of kernel selection.
+
+    The ``Override`` line reports what :func:`select_kernel` would honour for
+    this operator right now -- the ``TOKENSPEED_KERNEL_OVERRIDE_*`` environment
+    variable, an enclosing :func:`kernel_override`, or the explicit
+    ``override`` argument, in that precedence -- and the overridden kernel is
+    marked ``[SELECTED (override)]`` instead of the ranking's first entry.
+
+    Args:
+        override: Explicit override target, as a caller would pass to
+            :func:`select_kernel`; ``None`` reports only the ambient override.
+
+    Example output::
+
+        Op: attention.decode (bfloat16)
+        Platform: NVIDIA H100 (sm_90)
+        Solution: any
+        Override: none
+        Ranking: lex (oracle, priority); higher wins
+
+        Candidates (3 matched, 5 registered):
+          1. flashinfer_decode  [SELECTED]
+             ora=16 pri=14
+          2. triton_decode
+             ora=10 pri=10
+
+        Filtered out:
+          - aiter_decode: vendor mismatch (requires amd)
+    """
+    platform = platform or current_platform()
+    registry = KernelRegistry.get()
+
+    active_override = resolve_kernel_override(family, mode, override)
+    override_name: str | None = None
+    override_error: str | None = None
+    if active_override:
+        try:
+            override_name = _resolve_override(
+                registry,
+                family,
+                mode,
+                format_signature,
+                active_override,
+                platform,
+                features,
+            ).name
+        except NoKernelFoundError as exc:
+            override_error = str(exc)
+
+    all_specs = registry.list_kernels(family=family, mode=mode)
+    candidates = registry.get_for_operator(
+        family,
+        mode,
+        features=features,
+        platform=platform,
+        format_signature=format_signature,
+        solution=solution,
+    )
+
+    if traits:
+        candidates = _filter_by_traits(candidates, traits)
+
+    scored = _rank(candidates, platform, traits)
+
+    filtered_names = {s.name for s in candidates}
+    filtered_out = [s for s in all_specs if s.name not in filtered_names]
+
+    lines = [
+        f"Op: {family}.{mode} ({format_signature})",
+        f"Platform: {platform.device_name} ({platform.arch})",
+        f"Solution: {solution or 'any'}",
+        (
+            f"Override: {active_override} ({_override_origin(family, mode)})"
+            if active_override
+            else "Override: none"
+        ),
+        "Ranking: lex (oracle, priority); higher wins",
+        "",
+        f"Candidates ({len(scored)} matched, {len(all_specs)} registered):",
+    ]
+
+    for i, (spec, breakdown) in enumerate(scored):
+        if active_override:
+            marker = "  [SELECTED (override)]" if spec.name == override_name else ""
+        else:
+            marker = "  [SELECTED]" if i == 0 else ""
+        lines.append(f"  {i + 1}. {spec.name}{marker}")
+        lines.append(f"     {breakdown}")
+
+    if override_error:
+        lines.append("")
+        lines.append(f"Override does not resolve: {override_error}")
+    elif override_name and override_name not in filtered_names:
+        lines.append("")
+        lines.append(
+            f"Override selects {override_name}, which is not among the matched "
+            "candidates: overrides bypass platform, format-signature, solution "
+            "and trait filtering."
+        )
+
+    if filtered_out:
+        lines.append("")
+        lines.append("Filtered out:")
+        for spec in filtered_out:
+            reasons: list[str] = []
+            if (
+                spec.capability.vendors
+                and platform.vendor not in spec.capability.vendors
+            ):
+                reasons.append(
+                    f"vendor mismatch (requires "
+                    f"{', '.join(spec.capability.vendors)})"
+                )
+            missing = spec.capability.missing_features(platform)
+            if missing:
+                reasons.append(f"missing features: {', '.join(missing)}")
+            min_arch_version = spec.capability.min_arch_version_for(platform.vendor)
+            if min_arch_version:
+                if not (platform.arch_version >= min_arch_version):
+                    reasons.append(f"arch mismatch (requires {min_arch_version})")
+            if format_signature and not spec.supports_format_signature(
+                format_signature
+            ):
+                reasons.append(
+                    f"format signature mismatch (supports "
+                    f"{', '.join(str(d) for d in spec.format_signatures)})"
+                )
+            if solution and spec.solution != solution:
+                reasons.append(f"solution mismatch (is {spec.solution!r})")
+            reason_str = "; ".join(reasons) if reasons else "unknown"
+            lines.append(f"  - {spec.name}: {reason_str}")
+
+    return "\n".join(lines)
+
+
+def warmup_selection(
+    ops: list[tuple[str, str, FormatSignature, dict | None]] | None = None,
+) -> None:
+    """Pre-resolve kernel selection for explicit op signatures.
+
+    Pass ``ops`` from model initialization to front-load heuristic and autotune
+    costs for the actual hot-path call sites. Each entry must include the exact
+    ``FormatSignature`` and trait values used by runtime selection.
+
+    When ``ops`` is ``None``, this performs only a deterministic smoke warmup:
+    one representative signature for each registered operator, with no traits.
+    That path verifies the registry and fills a small cache sample, but it does
+    not warm all supported signatures, trait combinations, or feature-specific
+    call paths.
+    """
+
+    if ops is None:
+        ops = []
+        registry = KernelRegistry.get()
+        for family, mode in registry.list_operators():
+            specs = registry.get_for_operator(family, mode)
+            if not specs or not specs[0].format_signatures:
+                continue
+            # No-arg warmup is intentionally a smoke path. Pick a stable
+            # representative from the highest-priority spec; callers that need
+            # comprehensive warmup should pass explicit op signatures.
+            format_signature = sorted(specs[0].format_signatures, key=str)[0]
+            ops.append((family, mode, format_signature, None))
+
+    for family, mode, format_signature, traits in ops:
+        try:
+            select_kernel(family, mode, format_signature, traits=traits)
+        except NoKernelFoundError:
+            logger.debug(
+                f"[tokenspeed_kernel] warmup: no kernel for {family!s}.{mode!s}("
+                f"{format_signature!s})",
+            )

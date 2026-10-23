@@ -1,0 +1,1211 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+
+"""Utilities for downloading and initializing model weights."""
+
+import ctypes
+import fnmatch
+import glob
+import hashlib
+import importlib.util
+import json
+import mmap
+import os
+import struct
+import sys
+import tempfile
+import threading
+import time
+from collections.abc import Callable, Generator, Iterable
+from typing import Any
+
+import filelock
+import huggingface_hub.constants
+import numpy as np
+import psutil
+import safetensors.torch
+import torch
+from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
+from safetensors import safe_open
+from tokenspeed_kernel.platform import current_platform
+from tqdm.auto import tqdm
+
+from tokenspeed.runtime.configs.load_config import LoadConfig
+from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.hf_hub_retry import call_with_hf_rate_limit_retry
+from tokenspeed.runtime.layers.quantization import (
+    QuantizationConfig,
+    get_quantization_config,
+)
+from tokenspeed.runtime.layers.quantization.modelopt_mixed import normalize_quant_algo
+from tokenspeed.runtime.utils import get_colorful_logger
+
+logger = get_colorful_logger(__name__)
+
+# Checkpoint tensors holding a layer's key, value, or shared KV-cache scale.
+K_CACHE_SCALE_SUFFIXES = (".k_scale", "_k_scale", ".k_proj.output_scale")
+V_CACHE_SCALE_SUFFIXES = (".v_scale", "_v_scale", ".v_proj.output_scale")
+KV_CACHE_SCALE_SUFFIXES = (
+    *K_CACHE_SCALE_SUFFIXES,
+    *V_CACHE_SCALE_SUFFIXES,
+    ".kv_scale",
+)
+
+_AUXILIARY_SAFETENSORS_FILES = {"input_scales.safetensors"}
+
+# use system-level temp directory for file locks, so that multiple users
+# can share the same lock without error.
+# lock files in the temp directory will be automatically deleted when the
+# system reboots, so users will not complain about annoying lock files
+temp_dir = tempfile.gettempdir()
+
+
+def enable_hf_transfer():
+    """automatically activates hf_transfer"""
+    if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
+        if importlib.util.find_spec("hf_transfer") is not None:
+            huggingface_hub.constants.HF_HUB_ENABLE_HF_TRANSFER = True
+
+
+enable_hf_transfer()
+
+
+class DisabledTqdm(tqdm):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs["disable"] = True
+        super().__init__(*args, **kwargs)
+
+
+def get_lock(
+    model_name_or_path: str, cache_dir: str | None = None
+) -> filelock.FileLock:
+    lock_dir = cache_dir or temp_dir
+    os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
+    model_name = model_name_or_path.replace("/", "-")
+    hash_name = hashlib.sha256(model_name.encode()).hexdigest()
+    # add hash to avoid conflict with old users' lock files
+    lock_file_name = hash_name + model_name + ".lock"
+    # mode 0o666 is required for the filelock to be shared across users
+    return filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
+
+
+def _json_folder(model_config: ModelConfig, load_config: LoadConfig) -> str:
+    """Return the checkpoint folder holding its JSON files, fetched if remote."""
+    model_name_or_path = model_config.model_path
+    if os.path.isdir(model_name_or_path):
+        return model_name_or_path
+
+    def download_config_files() -> str:
+        return snapshot_download(
+            model_name_or_path,
+            revision=model_config.revision,
+            allow_patterns="*.json",
+            cache_dir=load_config.download_dir,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            tqdm_class=DisabledTqdm,
+        )
+
+    # Download the config files.
+    with get_lock(model_name_or_path, load_config.download_dir):
+        return call_with_hf_rate_limit_retry(
+            f"downloading config files of {model_name_or_path}",
+            download_config_files,
+        )
+
+
+def with_hf_quant_layers(quant_cfg: dict, hf_quant: dict) -> dict:
+    """Complete a per-layer ``quantization_config`` from ``hf_quant_config.json``.
+
+    ModelOpt writes both; a config.json copy can lack entries the export file
+    has (Nemotron 3.5 Super VL's leaves out its MTP experts), which would load
+    those modules as unquantized. Algorithms must agree after alias normalization.
+    """
+    layers = dict(quant_cfg["quantized_layers"])
+    missing = {}
+    for name, entry in hf_quant.get("quantized_layers", {}).items():
+        if name not in layers:
+            missing[name] = entry
+        elif normalize_quant_algo(
+            str(layers[name].get("quant_algo")).upper()
+        ) != normalize_quant_algo(str(entry.get("quant_algo")).upper()):
+            raise ValueError(
+                f"config.json quantizes {name} as {layers[name]}, "
+                f"hf_quant_config.json as {entry}"
+            )
+    if not missing:
+        return quant_cfg
+    logger.warning(
+        f"config.json's quantization_config lacks {len(missing)} quantized "
+        f"layers that hf_quant_config.json lists (e.g. {next(iter(missing))}); "
+        "taking them from hf_quant_config.json"
+    )
+    layers.update(missing)
+    return {**quant_cfg, "quantized_layers": layers}
+
+
+def get_quant_config(
+    model_config: ModelConfig, load_config: LoadConfig
+) -> QuantizationConfig:
+    quant_cls = get_quantization_config(model_config.quantization)
+
+    # Read the quantization config from the HF model config, if available.
+    hf_quant_config = getattr(model_config.hf_config, "quantization_config", None)
+    # some vision model may keep quantization_config in their text_config
+    hf_text_config = getattr(model_config.hf_config, "text_config", None)
+    if hf_quant_config is None and hf_text_config is not None:
+        hf_quant_config = getattr(hf_text_config, "quantization_config", None)
+    if hf_quant_config is None:
+        # compressed-tensors uses a compressions_config
+        hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
+    if hf_quant_config is not None:
+        if "quantized_layers" in hf_quant_config:
+            hf_quant_path = os.path.join(
+                _json_folder(model_config, load_config), "hf_quant_config.json"
+            )
+            if os.path.isfile(hf_quant_path):
+                with open(hf_quant_path, encoding="utf-8") as f:
+                    hf_quant = json.load(f).get("quantization", {})
+                hf_quant_config = with_hf_quant_layers(hf_quant_config, hf_quant)
+        return quant_cls.from_config(hf_quant_config)
+    hf_folder = _json_folder(model_config, load_config)
+
+    possible_config_filenames = quant_cls.get_config_filenames()
+
+    # If the quantization config is not found, use the default config.
+    if not possible_config_filenames:
+        return quant_cls()
+
+    config_files = glob.glob(os.path.join(hf_folder, "*.json"))
+
+    quant_config_files = [
+        f for f in config_files if any(f.endswith(x) for x in possible_config_filenames)
+    ]
+    if len(quant_config_files) == 0:
+        raise ValueError(f"Cannot find the config file for {model_config.quantization}")
+    if len(quant_config_files) > 1:
+        raise ValueError(
+            f"Found multiple config files for {model_config.quantization}: "
+            f"{quant_config_files}"
+        )
+
+    quant_config_file = quant_config_files[0]
+    with open(quant_config_file) as f:
+        config = json.load(f)
+
+        if model_config.quantization == "nvfp4":
+            # The nested-"quantization" schema is ModelOpt's; some exports (e.g. Inkling) omit producer.
+            producer = config.get("producer", {}).get("name", "modelopt")
+            if producer == "modelopt":
+                return quant_cls.from_config(config)
+            else:
+                raise ValueError(
+                    f"Unsupported quantization config"
+                    f" found for {model_config.quantization} in {f}."
+                )
+
+    return quant_cls.from_config(config)
+
+
+def download_weights_from_hf(
+    model_name_or_path: str,
+    cache_dir: str | None,
+    allow_patterns: list[str],
+    revision: str | None = None,
+    ignore_patterns: str | list[str] | None = None,
+) -> str:
+    """Download model weights from Hugging Face Hub.
+
+    Args:
+        model_name_or_path (str): The model name or path.
+        cache_dir (Optional[str]): The cache directory to store the model
+            weights. If None, will use HF defaults.
+        allow_patterns (List[str]): The allowed patterns for the
+            weight files. Files matched by any of the patterns will be
+            downloaded.
+        revision (Optional[str]): The revision of the model.
+        ignore_patterns (Optional[Union[str, List[str]]]): The patterns to
+            filter out the weight files. Files matched by any of the patterns
+            will be ignored.
+
+    Returns:
+        str: The path to the downloaded model weights.
+    """
+    if not huggingface_hub.constants.HF_HUB_OFFLINE:
+        # Before we download we look at that is available:
+        fs = HfFileSystem()
+        file_list = call_with_hf_rate_limit_retry(
+            f"listing weight files of {model_name_or_path}",
+            lambda: fs.ls(model_name_or_path, detail=False, revision=revision),
+        )
+
+        # depending on what is available we download different things
+        for pattern in allow_patterns:
+            matching = fnmatch.filter(file_list, pattern)
+            if len(matching) > 0:
+                allow_patterns = [pattern]
+                break
+
+    logger.info(f"Using model weights format {allow_patterns!s}")
+
+    def download_weights() -> str:
+        return snapshot_download(
+            model_name_or_path,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
+            cache_dir=cache_dir,
+            tqdm_class=DisabledTqdm,
+            revision=revision,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        )
+
+    # Use file lock to prevent multiple processes from
+    # downloading the same model weights at the same time.
+    with get_lock(model_name_or_path, cache_dir):
+        hf_folder = call_with_hf_rate_limit_retry(
+            f"downloading weights of {model_name_or_path}",
+            download_weights,
+        )
+    return hf_folder
+
+
+def download_safetensors_index_file_from_hf(
+    model_name_or_path: str,
+    index_file: str,
+    cache_dir: str | None,
+    revision: str | None = None,
+) -> None:
+    """Download hf safetensors index file from Hugging Face Hub.
+
+    Args:
+        model_name_or_path (str): The model name or path.
+        cache_dir (Optional[str]): The cache directory to store the model
+            weights. If None, will use HF defaults.
+        revision (Optional[str]): The revision of the model.
+    """
+
+    def download_index_file() -> str:
+        return hf_hub_download(
+            repo_id=model_name_or_path,
+            filename=index_file,
+            cache_dir=cache_dir,
+            revision=revision,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        )
+
+    # Use file lock to prevent multiple processes from
+    # downloading the same model weights at the same time.
+    with get_lock(model_name_or_path, cache_dir):
+        try:
+            # Download the safetensors index file.
+            call_with_hf_rate_limit_retry(
+                f"downloading {index_file} of {model_name_or_path}",
+                download_index_file,
+            )
+        # If file not found on remote or locally, we should not fail since
+        # only some models will have index_file.
+        except huggingface_hub.utils.EntryNotFoundError:
+            logger.info(f"No {index_file!s} found in remote.")
+        except huggingface_hub.utils.LocalEntryNotFoundError:
+            logger.info(f"No {index_file!s} found in local cache.")
+
+
+# For models like Mistral-7B-v0.3, there are both sharded
+# safetensors files and a consolidated safetensors file.
+# Passing both of these to the weight loader functionality breaks.
+# So, we use the index_file to
+# look up which safetensors files should be used.
+def filter_duplicate_safetensors_files(
+    hf_weights_files: list[str], hf_folder: str, index_file: str
+) -> list[str]:
+    # model.safetensors.index.json is a mapping from keys in the
+    # torch state_dict to safetensors file holding that weight.
+    index_file_name = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_file_name):
+        return hf_weights_files
+
+    # Iterate through the weight_map (weight_name: safetensors files)
+    # to identify weights that we should use.
+    with open(index_file_name) as f:
+        weight_map = json.load(f)["weight_map"]
+    weight_files_in_index = set()
+    for weight_name in weight_map:
+        weight_files_in_index.add(os.path.join(hf_folder, weight_map[weight_name]))
+    # ModelOpt may store activation scales in a standalone safetensors file
+    # that is intentionally absent from the model weight index. It is not a
+    # duplicate checkpoint, and dropping it leaves NVFP4 input scales
+    # uninitialized. Preserve known auxiliary files alongside indexed shards.
+    hf_weights_files = [
+        file_path
+        for file_path in hf_weights_files
+        if file_path in weight_files_in_index
+        or os.path.basename(file_path) in _AUXILIARY_SAFETENSORS_FILES
+    ]
+    return hf_weights_files
+
+
+def filter_safetensors_files_by_weight_names(
+    hf_weights_files: list[str],
+    hf_folder: str,
+    index_file: str,
+    weight_name_filter: Callable[[str], bool],
+) -> list[str]:
+    """Keep only the safetensors shards holding weights the consumer wants.
+
+    Used for draft (NextN/MTP) models whose weights are embedded in the
+    target checkpoint: their loaders consume a small name subset, so most
+    shards need not be read (or prefetched) at all.
+
+    Args:
+        hf_weights_files: Candidate shard paths.
+        hf_folder: Checkpoint directory containing ``index_file``.
+        index_file: Safetensors index file name mapping weight names to
+            shard file names.
+        weight_name_filter: Predicate on checkpoint weight names; a shard is
+            kept if it holds at least one accepted name.
+
+    Returns:
+        The filtered shard list, input order preserved. Shards absent from
+        the index are kept, and the full list is returned when the index is
+        missing or nothing matches, so a wrong predicate degrades to reading
+        extra shards instead of breaking the load.
+    """
+    index_file_name = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_file_name):
+        return hf_weights_files
+
+    with open(index_file_name) as f:
+        weight_map = json.load(f)["weight_map"]
+    needed_files = set()
+    for weight_name, shard_name in weight_map.items():
+        if weight_name_filter(weight_name):
+            needed_files.add(os.path.join(hf_folder, shard_name))
+    indexed_files = {
+        os.path.join(hf_folder, shard_name) for shard_name in weight_map.values()
+    }
+    filtered = [
+        f for f in hf_weights_files if f in needed_files or f not in indexed_files
+    ]
+    if not filtered:
+        logger.warning(
+            f"Weight-name shard filter matched nothing in {index_file_name}; "
+            f"falling back to loading all {len(hf_weights_files)} shards."
+        )
+        return hf_weights_files
+    if len(filtered) < len(hf_weights_files):
+        logger.info(
+            f"Loading {len(filtered)} of {len(hf_weights_files)} checkpoint "
+            "shards; the others hold no weights needed by this model."
+        )
+    return filtered
+
+
+def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:
+    """
+    Exclude files that are not needed for inference.
+
+    See https://github.com/huggingface/transformers/blob/v4.34.0/src/transformers/trainer.py#L227-L233
+    """
+    blacklist = [
+        "training_args.bin",
+        "optimizer.bin",
+        "optimizer.pt",
+        "scheduler.pt",
+        "scaler.pt",
+    ]
+    hf_weights_files = [
+        f for f in hf_weights_files if not any(f.endswith(x) for x in blacklist)
+    ]
+    return hf_weights_files
+
+
+# explicitly use pure text format, with a newline at the end
+# this makes it impossible to see the animation in the progress bar
+# but will avoid messing up with ray or multiprocessing, which wraps
+# each line of output with some prefix.
+_BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
+
+
+def np_cache_weights_iterator(
+    model_name_or_path: str,
+    cache_dir: str | None,
+    hf_folder: str,
+    hf_weights_files: list[str],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model np files.
+
+    Will dump the model weights to numpy files if they are not already dumped.
+    """
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+    # Convert the model weights from torch tensors to numpy arrays for
+    # faster loading.
+    np_folder = os.path.join(hf_folder, "np")
+    os.makedirs(np_folder, exist_ok=True)
+    weight_names_file = os.path.join(np_folder, "weight_names.json")
+    # Use file lock to prevent multiple processes from
+    # dumping the same model weights to numpy at the same time.
+    with get_lock(model_name_or_path, cache_dir):
+        if not os.path.exists(weight_names_file):
+            weight_names: list[str] = []
+            for bin_file in tqdm(
+                hf_weights_files,
+                desc="Loading np_cache checkpoint shards",
+                disable=not enable_tqdm,
+                bar_format=_BAR_FORMAT,
+            ):
+                state = torch.load(bin_file, map_location="cpu")
+                for name, param in state.items():
+                    param_path = os.path.join(np_folder, name)
+                    with open(param_path, "wb") as f:
+                        np.save(f, param.cpu().detach().numpy())
+                    weight_names.append(name)
+            with open(weight_names_file, "w") as f:
+                json.dump(weight_names, f)
+
+    with open(weight_names_file) as f:
+        weight_names = json.load(f)
+
+    for name in weight_names:
+        param_path = os.path.join(np_folder, name)
+        with open(param_path, "rb") as f:
+            param = np.load(f)
+        yield name, torch.from_numpy(param)
+
+
+def decrypt(fn, key):
+    raise NotImplementedError()
+
+
+def safetensors_encrypted_weights_iterator(
+    hf_weights_files: list[str],
+    is_all_weights_sharded: bool = False,
+    decryption_key: str | None = None,
+):
+    raise NotImplementedError()
+
+
+class CheckpointPrefetcher:
+    """Read bounded checkpoint shards ahead using parallel contiguous ranges.
+
+    A fixed set of reader threads claims contiguous ranges in shard order.
+    Readers are reused across shards, and a shard becomes ready only after
+    all its ranges finish. Completed shards remain in the window until the
+    consumer advances.
+
+    The window is min(40 GiB, 25% of available host memory). It bounds ahead
+    bytes, not total page-cache occupancy. Local ranks share cached file pages
+    and divide background reads by shard index. Every shard still occupies
+    the window, including shards another local rank reads. Consumers do not
+    synchronize: a peer's unfinished read falls back to demand paging.
+
+    Args:
+        files: Shard paths in the exact order the consumer will load them.
+        num_threads: Maximum concurrent range readers per rank.
+        local_rank: Reader index among local ranks loading the same files.
+        local_world_size: Number of those local readers, never global TP size.
+    """
+
+    _BLOCK_SIZE = 4 * 1024**2
+    _MIN_RANGE_SIZE = 64 * 1024**2
+    _WINDOW_MAX_BYTES = 40 * 1024**3
+    _WINDOW_MEM_FRACTION = 0.25
+
+    @classmethod
+    def _read_range(cls, file_path: str, start: int, end: int) -> int:
+        remaining = end - start
+        buffer = bytearray(min(cls._BLOCK_SIZE, remaining))
+        with open(file_path, "rb", buffering=0) as f, memoryview(buffer) as view:
+            f.seek(start)
+            while remaining:
+                count = f.readinto(view[: min(len(buffer), remaining)])
+                if not count:
+                    raise EOFError(
+                        f"Checkpoint shard ended before byte {end}: {file_path}"
+                    )
+                remaining -= count
+        return end - start
+
+    def __init__(
+        self,
+        files: list[str],
+        num_threads: int = 8,
+        *,
+        local_rank: int,
+        local_world_size: int,
+    ) -> None:
+        if not 0 <= local_rank < local_world_size:
+            raise ValueError("local_rank must be in [0, local_world_size)")
+        self._files = list(files)
+        self._local_rank = local_rank
+        self._local_world_size = local_world_size
+        self._owned_files = len(self._files[local_rank::local_world_size])
+        self._sizes = [os.path.getsize(path) for path in self._files]
+        self._num_threads = max(1, num_threads)
+        self._range_sizes = []
+        self._ranges_remaining = []
+        for size in self._sizes:
+            readers = min(
+                self._num_threads,
+                max(1, (size + self._MIN_RANGE_SIZE - 1) // self._MIN_RANGE_SIZE),
+            )
+            range_size = max(
+                self._BLOCK_SIZE,
+                (size + readers * self._BLOCK_SIZE - 1)
+                // (readers * self._BLOCK_SIZE)
+                * self._BLOCK_SIZE,
+            )
+            self._range_sizes.append(range_size)
+            self._ranges_remaining.append(max(1, (size + range_size - 1) // range_size))
+        self._window_bytes = min(
+            self._WINDOW_MAX_BYTES,
+            int(psutil.virtual_memory().available * self._WINDOW_MEM_FRACTION),
+        )
+        self._cond = threading.Condition()
+        self._next_to_read = 0
+        self._next_offset = 0
+        self._stopped = False
+        self._threads: list[threading.Thread] = []
+        self._files_read = 0
+        self._inflight_bytes = 0  # claimed by a reader, not yet consumed
+        self._ready = [threading.Event() for _ in self._files]
+        self._start_time = 0.0
+
+    def start(self) -> None:
+        logger.info(
+            f"Prefetching {self._owned_files}/{len(self._files)} checkpoint shards "
+            f"as local reader {self._local_rank}/{self._local_world_size} into the OS page "
+            f"cache (window {self._window_bytes / 1024**3:.1f} GiB, "
+            f"up to {self._num_threads} range-reader threads)."
+        )
+        self._start_time = time.perf_counter()
+        for _ in range(min(self._num_threads, sum(self._ranges_remaining))):
+            thread = threading.Thread(target=self._reader, daemon=True)
+            self._threads.append(thread)
+            thread.start()
+
+    def _reader(self) -> None:
+        while True:
+            with self._cond:
+                while True:
+                    if self._stopped or self._next_to_read >= len(self._files):
+                        return
+                    idx = self._next_to_read
+                    size = self._sizes[idx]
+                    if self._next_offset == 0:
+                        # An oversized shard is admitted alone; charge each shard once.
+                        if (
+                            self._inflight_bytes
+                            and self._inflight_bytes + size > self._window_bytes
+                        ):
+                            self._cond.wait()
+                            continue
+                        self._inflight_bytes += size
+                        if idx % self._local_world_size != self._local_rank:
+                            # Keep the full consumer-order window even when a
+                            # peer owns the read; shortening it multiplies read-ahead.
+                            self._next_to_read += 1
+                            self._ready[idx].set()
+                            continue
+                    start = self._next_offset
+                    end = min(size, start + self._range_sizes[idx])
+                    self._next_offset = end
+                    if end == size:
+                        self._next_to_read += 1
+                        self._next_offset = 0
+                    break
+            try:
+                self._read_range(self._files[idx], start, end)
+            except Exception:
+                logger.warning(
+                    f"Failed to prefetch checkpoint shard {self._files[idx]}; "
+                    f"the consumer will fall back to demand paging for it.",
+                    exc_info=True,
+                )
+            with self._cond:
+                self._ranges_remaining[idx] -= 1
+                if self._ranges_remaining[idx]:
+                    continue
+                # Failed ranges also release the consumer to use demand paging.
+                self._ready[idx].set()
+                self._files_read += 1
+                all_read = self._files_read == self._owned_files
+            if all_read:
+                logger.info(
+                    "Checkpoint prefetch finished after "
+                    f"{time.perf_counter() - self._start_time:.2f}s."
+                )
+
+    def close(self) -> None:
+        """Stop admitting work and wait for active range reads to finish."""
+        with self._cond:
+            self._stopped = True
+            self._cond.notify_all()
+        for thread in self._threads:
+            thread.join()
+
+    def wait_file(self, idx: int) -> None:
+        """Wait for window admission and this rank's read, if it owns the shard."""
+        self._ready[idx].wait()
+
+    def advance(self, idx: int) -> None:
+        """Tell the prefetcher shard ``idx`` has been consumed, freeing window budget."""
+        with self._cond:
+            self._inflight_bytes -= self._sizes[idx]
+            self._cond.notify_all()
+
+
+def _madvise_sequential(tensors: Iterable[torch.Tensor]) -> None:
+    """Keep consumed file-backed storages from acquiring mmap reuse protection."""
+    if sys.platform != "linux":
+        return
+    ranges = []
+    for tensor in tensors:
+        storage = tensor.untyped_storage()
+        size = storage.nbytes()
+        if not size:
+            continue
+        address = storage.data_ptr()
+        start = address // mmap.PAGESIZE * mmap.PAGESIZE
+        end = (address + size + mmap.PAGESIZE - 1) // mmap.PAGESIZE * mmap.PAGESIZE
+        ranges.append((start, end))
+    merged = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    libc = ctypes.CDLL(None, use_errno=True)
+    madvise = libc.madvise
+    madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    madvise.restype = ctypes.c_int
+    for start, end in merged:
+        if madvise(start, end - start, mmap.MADV_SEQUENTIAL):
+            logger.debug(
+                f"Could not advise checkpoint mapping: {os.strerror(ctypes.get_errno())}"
+            )
+
+
+def safetensors_weights_iterator(
+    hf_weights_files: list[str],
+    is_all_weights_sharded: bool = False,
+    decryption_key: str | None = None,
+    prefetch: bool = False,
+    prefetch_num_threads: int = 8,
+    *,
+    local_rank: int,
+    local_world_size: int,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model safetensor files.
+
+    If is_all_weights_sharded is True, it uses more optimize read by reading an
+    entire file instead of reading each tensor one by one.
+
+    If prefetch is True, shards are sequentially read into the OS page cache a
+    bounded window ahead of this iterator (see CheckpointPrefetcher),
+    paced by how fast the caller actually consumes the yielded tensors. The
+    pacing only works if the caller loads weights while iterating instead of
+    draining the iterator into a list first.
+    """
+    if decryption_key:
+        yield from safetensors_encrypted_weights_iterator(
+            hf_weights_files, is_all_weights_sharded, decryption_key
+        )
+        return
+
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+    prefetcher = None
+    if prefetch:
+        prefetcher = CheckpointPrefetcher(
+            hf_weights_files,
+            num_threads=prefetch_num_threads,
+            local_rank=local_rank,
+            local_world_size=local_world_size,
+        )
+        prefetcher.start()
+
+    try:
+        for file_idx, st_file in enumerate(
+            tqdm(
+                hf_weights_files,
+                desc="Loading safetensors checkpoint shards",
+                disable=not enable_tqdm,
+                bar_format=_BAR_FORMAT,
+            )
+        ):
+            if prefetcher is not None:
+                prefetcher.wait_file(file_idx)
+            result = safetensors.torch.load_file(st_file, device="cpu")
+            if prefetcher is not None:
+                _madvise_sequential(result.values())
+            yield from result.items()
+            if prefetcher is not None:
+                prefetcher.advance(file_idx)
+    finally:
+        if prefetcher is not None:
+            prefetcher.close()
+
+
+def safetensors_filtered_weights_iterator(
+    hf_weights_files: list[str],
+    accept: Callable[[str], bool],
+    prefetch: bool = False,
+    prefetch_num_threads: int = 8,
+    *,
+    local_rank: int,
+    local_world_size: int,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield accepted tensors one at a time via ``get_tensor``, never load_file.
+
+    Used when a model must skip huge tables (Engram embed) that share a shard
+    with ordinary weights. Rejected keys are not materialized.
+    """
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+    prefetcher = None
+    if prefetch:
+        prefetcher = CheckpointPrefetcher(
+            hf_weights_files,
+            num_threads=prefetch_num_threads,
+            local_rank=local_rank,
+            local_world_size=local_world_size,
+        )
+        prefetcher.start()
+    try:
+        for file_idx, st_file in enumerate(
+            tqdm(
+                hf_weights_files,
+                desc="Loading safetensors checkpoint shards",
+                disable=not enable_tqdm,
+                bar_format=_BAR_FORMAT,
+            )
+        ):
+            if prefetcher is not None:
+                prefetcher.wait_file(file_idx)
+            with safe_open(st_file, framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    if not accept(key):
+                        continue
+                    yield key, handle.get_tensor(key)
+            if prefetcher is not None:
+                prefetcher.advance(file_idx)
+    finally:
+        if prefetcher is not None:
+            prefetcher.close()
+
+
+_SUB_BYTE_SAFETENSORS_DTYPES = frozenset({"F4", "F6_E2M3", "F6_E3M2"})
+
+# Bounds a corrupt length prefix; real headers are a few hundred KB.
+_MAX_SAFETENSORS_HEADER_BYTES = 128 * 1024 * 1024
+
+
+def _find_sub_byte_dtype(hf_weights_files: list[str]) -> str | None:
+    """Return the first sub-byte dtype any shard declares, else ``None``.
+
+    InstantTensor 0.1.9 applies a header's logical element count to a torch
+    dtype whose element is a packed pair, so an ``F4`` tensor declared ``[2048]``
+    over 1024 bytes arrives as shape ``(2048,)`` -- twice its own storage --
+    where safetensors correctly reports ``(1024,)``. Nothing raises, so callers
+    must refuse these checkpoints rather than load them wrong.
+
+    Only each shard's length-prefixed JSON header is read, never tensor data.
+    A header that will not parse raises: this decides whether a checkpoint is
+    safe to load, so it must not wave through the shard it cannot inspect.
+    """
+    for path in hf_weights_files:
+        with open(path, "rb") as f:
+            (header_len,) = struct.unpack("<Q", f.read(8))
+            if header_len > _MAX_SAFETENSORS_HEADER_BYTES:
+                raise ValueError(
+                    f"{path}: safetensors header claims {header_len} bytes"
+                )
+            header = json.loads(f.read(header_len))
+
+        if not isinstance(header, dict):
+            raise ValueError(f"{path}: safetensors header is not a JSON object")
+
+        for name, meta in header.items():
+            if name == "__metadata__" or not isinstance(meta, dict):
+                continue
+            if meta.get("dtype") in _SUB_BYTE_SAFETENSORS_DTYPES:
+                return meta["dtype"]
+    return None
+
+
+def safetensors_tensor_shapes(
+    hf_weights_files: list[str],
+) -> dict[str, tuple[int, ...]]:
+    """Return each tensor's shape as the shards' headers declare it.
+
+    Reads only each shard's length-prefixed JSON header, never tensor data,
+    so a caller can refuse a checkpoint before loading any of it. A shard
+    whose header will not parse, or whose file is shorter than the data its
+    header declares (truncated, or still being written), raises ``ValueError``.
+    """
+    shapes: dict[str, tuple[int, ...]] = {}
+    for path in hf_weights_files:
+        try:
+            with open(path, "rb") as f:
+                (header_len,) = struct.unpack("<Q", f.read(8))
+                if header_len > _MAX_SAFETENSORS_HEADER_BYTES:
+                    raise ValueError(f"header claims {header_len} bytes")
+                header = json.loads(f.read(header_len))
+            if not isinstance(header, dict):
+                raise ValueError("header is not a JSON object")
+            data_end = 0
+            for name, meta in header.items():
+                if name == "__metadata__":
+                    continue
+                shapes[name] = tuple(int(dim) for dim in meta["shape"])
+                data_end = max(data_end, int(meta["data_offsets"][1]))
+            declared = 8 + header_len + data_end
+            on_disk = os.path.getsize(path)
+            if on_disk < declared:
+                raise ValueError(f"{on_disk} bytes on disk, header declares {declared}")
+        except (OSError, ValueError, LookupError, TypeError, struct.error) as e:
+            raise ValueError(f"{path}: unreadable safetensors shard ({e})") from e
+    return shapes
+
+
+def instanttensor_weights_iterator(
+    hf_weights_files: list[str],
+    *,
+    process_group: torch.distributed.ProcessGroup | None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model safetensor files using the
+    InstantTensor library.
+
+    InstantTensor accelerates loading safetensors weights on NVIDIA GPUs
+    through distributed loading, pipelined prefetching, and direct I/O. When
+    a process group is supplied, reads are sharded across those ranks. All
+    participants must consume the same checkpoint files and tensor iterator.
+
+    Args:
+        hf_weights_files: Local paths to the ``*.safetensors`` shards to load.
+        process_group: Ranks consuming the same weights, or None for local
+            loading. Pipeline context models use their stage's TP group.
+
+    Yields:
+        ``(name, tensor)`` pairs for every tensor in the checkpoint, with the
+        tensors materialized on the current CUDA device.
+    """
+    if not current_platform().is_nvidia:
+        raise ValueError("InstantTensor requires NVIDIA GPUs")
+
+    try:
+        import instanttensor
+    except ImportError as e:
+        raise ImportError(
+            'Please install instanttensor via `pip install "tokenspeed[instanttensor]"`'
+        ) from e
+
+    sub_byte_dtype = _find_sub_byte_dtype(hf_weights_files)
+    if sub_byte_dtype is not None:
+        raise ValueError(
+            f"This checkpoint declares the sub-byte safetensors dtype "
+            f"{sub_byte_dtype!r}, which InstantTensor loads incorrectly. "
+            "Use --load-format auto instead."
+        )
+
+    return _instanttensor_tensors(instanttensor, hf_weights_files, process_group)
+
+
+def _instanttensor_tensors(
+    instanttensor,
+    hf_weights_files: list[str],
+    process_group: torch.distributed.ProcessGroup | None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    device = torch.cuda.current_device()
+
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+
+    with instanttensor.safe_open(
+        hf_weights_files, framework="pt", device=device, process_group=process_group
+    ) as f:
+        # InstantTensor 0.1.9 clones internally, so no extra clone here.
+        yield from tqdm(
+            f.tensors(),
+            desc="Loading safetensors using InstantTensor loader",
+            disable=not enable_tqdm,
+            bar_format=_BAR_FORMAT,
+            total=len(f.keys()),
+            mininterval=1.0,
+        )
+
+
+def pt_weights_iterator(
+    hf_weights_files: list[str],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model bin/pt files."""
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+    for bin_file in tqdm(
+        hf_weights_files,
+        desc="Loading pt checkpoint shards",
+        disable=not enable_tqdm,
+        bar_format=_BAR_FORMAT,
+    ):
+        state = torch.load(bin_file, map_location="cpu")
+        yield from state.items()
+        del state
+        torch.cuda.empty_cache()
+
+
+def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+    """Default weight loader."""
+    if param.numel() == 1 and loaded_weight.numel() == 1:
+        # Sometimes scalar values aren't considered tensors with shapes
+        # so if both param and loaded_weight are a scalar,
+        # "broadcast" instead of copy
+        param.data.fill_(loaded_weight.item())
+    else:
+        if param.size() != loaded_weight.size():
+            raise ValueError(
+                f"Attempted to load weight ({loaded_weight.size()}) "
+                f"into parameter ({param.size()})"
+            )
+
+        param.data.copy_(loaded_weight)
+
+
+def bind_or_copy(existing: torch.Tensor | None, derived: torch.Tensor) -> torch.Tensor:
+    """Keep a derived weight's storage across live weight updates.
+
+    Derived weights such as the absorbed MLA ``w_kc``/``w_vc`` are rebuilt
+    from the loaded parameters after every load. Captured CUDA graphs hold the
+    address of the tensor the model used at capture time, so a live update
+    must write the new values into that tensor rather than rebind the
+    attribute. Returns ``derived`` on the first build (``existing`` is None),
+    otherwise copies it into ``existing`` and returns ``existing``.
+
+    Raises:
+        ValueError: ``existing`` and ``derived`` differ in shape, dtype or
+            device. A live update rewrites values, never geometry; silently
+            rebinding would leave captured graphs on the old tensor.
+    """
+    if existing is None:
+        return derived
+    if (
+        existing.shape != derived.shape
+        or existing.dtype != derived.dtype
+        or existing.device != derived.device
+    ):
+        raise ValueError(
+            "derived weight changed geometry across a live update: existing "
+            f"{tuple(existing.shape)!s}/{existing.dtype!s}/{existing.device!s}, "
+            f"derived {tuple(derived.shape)!s}/{derived.dtype!s}/{derived.device!s}"
+        )
+    existing.copy_(derived)
+    return existing
+
+
+LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+
+
+def sharded_weight_loader(shard_axis: int, tp_rank: int) -> LoaderFunction:
+    """Create a weight loader that shards the weights along the given axis"""
+
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        shard_size = param.data.shape[shard_axis]
+        start_idx = tp_rank * shard_size
+        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
+
+        return default_weight_loader(param, loaded_weight)
+
+    return loader
+
+
+def initialize_dummy_weights(
+    model: torch.nn.Module,
+    low: float = -1e-3,
+    high: float = 1e-3,
+    seed: int = 1234,
+) -> None:
+    """Initialize model weights with random values.
+
+    The model weights must be randomly initialized for accurate performance
+    measurements. Additionally, the model weights should not cause NaNs in the
+    forward pass. We empirically found that initializing the weights with
+    values between -1e-3 and 1e-3 works well for most models.
+
+    We use per-parameter random seed, so that dummy weights are consistent,
+    even if the model is partitioned across multiple devices. When the seed
+    is fixed, the random values generated by this function only depends on
+    the parameter's number of elements and its data type.
+    """
+    for param in model.state_dict().values():
+        if torch.is_floating_point(param):
+            generator = torch.Generator(device=param.data.device)
+            generator.manual_seed(seed)
+            if torch.finfo(param.data.dtype).bits < 16:
+                # uniform_ doesn't support < 16-bit datatypes (FP8)
+                dtype = param.data.dtype
+                tmp_param = param.data.to(torch.float16)
+                tmp_param = tmp_param.uniform_(low, high, generator=generator).to(dtype)
+                param.data.copy_(tmp_param)
+            else:
+                param.uniform_(low, high, generator=generator)
+
+
+def initialize_dummy_integer_weights(model: torch.nn.Module, seed: int = 1234) -> None:
+    """Give integer parameters valid values in place of checkpoint data.
+
+    Integer parameters hold packed weights, E8M0 scale bytes and index tables,
+    where uninitialized memory can decode to inf or NaN or index out of range.
+    They are zeroed, which is valid for all three. A parameter can set
+    ``dummy_initializer(param, generator)`` when zero is valid but
+    unrepresentative, such as an expert-id table that would send every token
+    to one expert. A floating-point parameter that post-processing checks,
+    such as a scale that starts as NaN until the checkpoint fills it, can set
+    one too; other floating-point parameters are left as they are.
+    """
+    for param in model.parameters():
+        initializer = getattr(param, "dummy_initializer", None)
+        if initializer is None:
+            if not torch.is_floating_point(param):
+                param.data.zero_()
+            continue
+        generator = torch.Generator(device=param.data.device)
+        generator.manual_seed(seed)
+        initializer(param, generator)
+
+
+def record_non_unit_kv_scales(
+    weights: Iterable[tuple[str, torch.Tensor]], rejected: list[str]
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Pass weights through without their KV-cache scales, appending each one
+    other than one to ``rejected``: a weight update never changes the scales
+    an FP8 KV cache was loaded with."""
+    for name, tensor in weights:
+        if name.endswith(KV_CACHE_SCALE_SUFFIXES):
+            if not bool(torch.all(tensor == 1)):
+                rejected.append(f"{name}={tensor.flatten()[:4].tolist()}")
+            continue
+        yield name, tensor
+
+
+def split_kv_cache_scales(
+    weights: Iterable[tuple[str, torch.Tensor]], scales: dict[str, torch.Tensor]
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Pass checkpoint weights through without their KV-cache scales,
+    collecting each one other than one into ``scales`` by checkpoint name."""
+    for name, tensor in weights:
+        if name.endswith(KV_CACHE_SCALE_SUFFIXES):
+            if not bool(torch.all(tensor == 1)):
+                scales[name] = tensor
+            continue
+        yield name, tensor
+
+
+def non_unit_kv_scale_message(rejected: list[str]) -> str:
+    return (
+        f"checkpoint KV-cache scales {', '.join(rejected)}; "
+        "only unit KV-cache scales are supported"
+    )
+
+
+def require_unit_kv_scale_file(path: str) -> None:
+    """Reject a ``--quantization-param-path`` file with a KV scale other than one."""
+    try:
+        with open(path) as f:
+            scaling_factor = json.load(f)["kv_cache"]["scaling_factor"]
+        scales = [
+            (tp_rank, layer, float(scale))
+            for tp_rank, layer_scales in scaling_factor.items()
+            for layer, scale in layer_scales.items()
+        ]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        raise ValueError(
+            f"{path}: expected a JSON file with kv_cache.scaling_factor "
+            f"{{tp_rank: {{layer: scale}}}} ({e!r})"
+        ) from e
+    for tp_rank, layer, scale in scales:
+        if scale != 1.0:
+            raise ValueError(
+                f"{path}: KV-cache scale {scale} for TP rank {tp_rank} layer "
+                f"{layer}; only unit KV-cache scales are supported"
+            )
+
+
+def mamba_v2_sharded_weight_loader(
+    shard_spec: list[tuple[int, int, float]],
+    tp_size: int,
+    tp_rank: int,
+) -> LoaderFunction:
+    """Create a weight loader for mamba v2. This ensures that the projections
+    are correctly sharded so that they can be split into x, B, C. It also
+    ensures the the all the groups corresponding to a head shard is placed
+    together with it.
+    """
+
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+
+        # - track boundary of (sharded) param, and loaded_weight, respectively
+        boundary, loaded_boundary = 0, 0
+
+        # - iterate over the shard specs
+        for full_dim, extra, duplicate_groups in shard_spec:
+            # - full dim is the model dim (before TP).
+            # - extra > 0, means there is expected overall increase
+            #   of dimensions. This is so because of replication.
+            # - ratio is used map the tp_rank to the actual shard
+            #   rank. This is useful when there is replication of
+            #   groups to accompany head shards.
+
+            # - size of the loaded shard
+            shard_size = full_dim // tp_size
+
+            # - compute the rank into the loaded shard.
+            # - if there is replication, different TP shards will
+            #   take from the same rank.
+            #  currently we only support duplication
+            # in the case where num_groups == 1
+            rank = 0 if duplicate_groups else tp_rank
+
+            # - leftmost boundary index into loaded weight.
+            loaded_skip = rank * shard_size
+            loaded_start_idx = loaded_boundary + loaded_skip
+
+            # - take these many dims from the loaded weight.
+            take = min(shard_size, full_dim - extra - loaded_skip)
+
+            # - always shard on dim 0
+            # - the ignore is for a mundane mypy error as it does not
+            #   seem to handle slices well.
+            # https://github.com/python/mypy/issues/2410
+            param.data[
+                boundary : (boundary + take), ...  # type: ignore[misc]
+            ] = loaded_weight[
+                loaded_start_idx : (loaded_start_idx + take)  # type: ignore[misc]
+            ]  # type: ignore[misc]
+
+            # move indexing boundaries
+            boundary += shard_size
+            loaded_boundary += full_dim - extra
+
+    return loader

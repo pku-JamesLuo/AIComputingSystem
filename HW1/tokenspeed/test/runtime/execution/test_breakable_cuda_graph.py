@@ -1,0 +1,1019 @@
+"""Unit tests for the breakable CUDA graph core (Phase 1).
+
+Captures a tiny ``Linear -> eager break -> Linear`` forward with
+:class:`BreakableCapture`, mutates the static input buffer, replays, and asserts
+the replayed output matches an eager recompute. This exercises the load-bearing
+invariants in isolation -- segment splitting, the eager break handoff, shared
+mempool address stability -- without touching the model or the hot path.
+"""
+
+import contextlib
+import dataclasses
+import os
+import sys
+
+import pytest
+
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=15, suite="runtime-1gpu")
+
+from types import SimpleNamespace  # noqa: E402
+
+import torch  # noqa: E402
+
+from tokenspeed.runtime.execution.breakable_cuda_graph import (  # noqa: E402
+    BreakableCapture,
+    active_forward,
+    break_here,
+    break_point,
+    current_forward_ctx,
+    current_valid_rows,
+    is_breakable_capture_active,
+    scrub_padding_tail,
+    slice_to_real_tokens,
+)
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
+class TestBreakableCudaGraph:
+    def setup_method(self):
+        torch.manual_seed(0)
+        self.dev = "cuda"
+        self.dtype = torch.float32
+        self.n, self.d = 8, 16
+        self.w1 = torch.randn(self.d, self.d, device=self.dev, dtype=self.dtype)
+        self.w2 = torch.randn(self.d, self.d, device=self.dev, dtype=self.dtype)
+        # Static input buffer: graphs read this address; live inputs are copied in.
+        self.x_static = torch.zeros(self.n, self.d, device=self.dev, dtype=self.dtype)
+
+    def _eager(self, x):
+        """Reference forward: Linear -> relu (the "break" op) -> Linear."""
+        h = x @ self.w1
+        h = torch.relu(h)
+        return h @ self.w2
+
+    def _build_capture(self):
+        """Capture the same forward with relu as an eager break."""
+        cap = BreakableCapture()
+
+        def forward():
+            h = self.x_static @ self.w1
+            # Break-output buffer, allocated in-segment so it is pool-pinned.
+            dst = torch.empty_like(h)
+            h = break_here(torch.relu, dst, h)
+            return h @ self.w2
+
+        # Warm up (cublas workspace / lazy init) before capture.
+        for _ in range(3):
+            forward()
+        torch.cuda.synchronize()
+
+        with cap:
+            captured_out = forward()
+        return cap, captured_out
+
+    def test_break_here_passthrough_when_inactive(self):
+        assert not (is_breakable_capture_active())
+        h = torch.randn(self.n, self.d, device=self.dev, dtype=self.dtype)
+        dst = torch.empty_like(h)
+        out = break_here(torch.relu, dst, h)
+        assert (out) is (dst)
+        torch.testing.assert_close(out, torch.relu(h))
+
+    def test_segments_split_at_break(self):
+        cap, _ = self._build_capture()
+        # Two graph segments (before/after relu) + one eager break = 3.
+        assert (cap.num_segments) == (3)
+
+    def test_replay_matches_eager(self):
+        cap, captured_out = self._build_capture()
+        for trial in range(5):
+            new_x = torch.randn(self.n, self.d, device=self.dev, dtype=self.dtype)
+            self.x_static.copy_(new_x)
+            cap.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                captured_out, self._eager(new_x), msg=f"trial {trial}"
+            )
+
+    def test_replay_clears_unwritten_padding_at_break_handoff(self):
+        """A padded replay must not pass an eager break's undefined tail onward."""
+        state = {"valid_rows": self.n}
+
+        class VarlenOp:
+            @break_point
+            def forward(self, x):
+                out = torch.full_like(x, torch.nan)
+                rows = state["valid_rows"]
+                out[:rows].copy_(x[:rows])
+                return out
+
+        op = VarlenOp()
+
+        def forward():
+            h = self.x_static @ self.w1
+            return op.forward(h) @ self.w2
+
+        for _ in range(3):
+            forward()
+        torch.cuda.synchronize()
+        cap = BreakableCapture()
+        with cap:
+            captured_out = forward()
+
+        state["valid_rows"] = 1
+        new_x = torch.randn(self.n, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static.copy_(new_x)
+        cap.replay(valid_rows=1)
+        torch.cuda.synchronize()
+
+        expected = torch.zeros_like(captured_out)
+        expected[:1] = (new_x @ self.w1)[:1] @ self.w2
+        torch.testing.assert_close(captured_out, expected, rtol=1e-4, atol=1e-4)
+
+    def test_break_body_reads_the_replay_valid_row_count(self):
+        """A break narrows its own padded input from ``current_valid_rows``."""
+        seen = []
+
+        class SlicingOp:
+            @break_point
+            def forward(self, x):
+                rows = current_valid_rows()
+                seen.append(rows)
+                (x,) = slice_to_real_tokens(x.shape[0] if rows is None else rows, x)
+                return x * 2
+
+        op = SlicingOp()
+
+        def forward():
+            return op.forward(self.x_static @ self.w1) @ self.w2
+
+        for _ in range(3):
+            forward()
+        torch.cuda.synchronize()
+        seen.clear()
+        cap = BreakableCapture()
+        with cap:
+            captured_out = forward()
+
+        new_x = torch.randn(self.n, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static.copy_(new_x)
+        cap.replay(valid_rows=1)
+        torch.cuda.synchronize()
+
+        assert seen == [None, 1]
+        assert current_valid_rows() is None
+        expected = torch.zeros_like(captured_out)
+        expected[:1] = ((new_x @ self.w1)[:1] * 2) @ self.w2
+        torch.testing.assert_close(captured_out, expected, rtol=1e-4, atol=1e-4)
+
+    def test_multiple_breaks_chain(self):
+        """Many breaks (like a deep transformer) must chain correctly."""
+        depth = 6
+        ws = [
+            torch.randn(self.d, self.d, device=self.dev, dtype=self.dtype)
+            for _ in range(depth + 1)
+        ]
+
+        def eager(x):
+            h = x @ ws[0]
+            for i in range(depth):
+                h = torch.relu(h)  # the "break" op
+                h = h @ ws[i + 1]
+            return h
+
+        cap = BreakableCapture()
+
+        def forward():
+            h = self.x_static @ ws[0]
+            for i in range(depth):
+                dst = torch.empty_like(h)
+                h = break_here(torch.relu, dst, h)
+                h = h @ ws[i + 1]
+            return h
+
+        for _ in range(3):
+            forward()
+        torch.cuda.synchronize()
+        with cap:
+            captured_out = forward()
+
+        # depth breaks => depth+1 graph segments + depth eager breaks.
+        assert (cap.num_segments) == (2 * depth + 1)
+        for trial in range(4):
+            new_x = torch.randn(self.n, self.d, device=self.dev, dtype=self.dtype)
+            self.x_static.copy_(new_x)
+            cap.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(captured_out, eager(new_x), msg=f"trial {trial}")
+
+    def test_nested_capture_rejected(self):
+        with BreakableCapture():
+            with pytest.raises((RuntimeError)):
+                with BreakableCapture():
+                    pass
+
+    def test_scrub_padding_tail(self):
+        # Zeros [num_real:] in place across tensors; skips None; no-op when unpadded.
+        t1 = torch.ones(6, 3, device=self.dev, dtype=self.dtype)
+        t2 = torch.ones(6, device=self.dev, dtype=self.dtype)
+        scrub_padding_tail(4, t1, None, t2)
+        assert bool((t1[:4] == 1).all()) and bool((t1[4:] == 0).all())
+        assert bool((t2[:4] == 1).all()) and bool((t2[4:] == 0).all())
+        # Unpadded (count == rows): untouched.
+        t3 = torch.ones(4, 3, device=self.dev, dtype=self.dtype)
+        scrub_padding_tail(4, t3)
+        assert bool((t3 == 1).all())
+
+    def test_slice_to_real_tokens(self):
+        """Leading [:num_real] per tensor in order; None and unpadded pass through."""
+        a = torch.arange(6, device=self.dev)
+        b = torch.arange(6, device=self.dev).view(6, 1)
+        c = torch.arange(4, device=self.dev)  # already real length
+        ra, rn, rb, rc = slice_to_real_tokens(4, a, None, b, c)
+        assert (ra.shape[0]) == (4)
+        assert (rb.shape[0]) == (4)
+        assert (rn) is None
+        assert (rc) is (c)  # no-op: not padded
+        torch.testing.assert_close(ra, torch.arange(4, device=self.dev))
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
+class TestBucketedCapture:
+    """Per-token-bucket lazy capture with input padding (what PrefillGraph does).
+
+    A token-shaped inner forward whose per-layer "attention" runs as an eager
+    break is captured once per padded token bucket and replayed for any real token
+    count <= bucket. Mirrors the runner's mechanics directly on BreakableCapture so
+    the bucketing + padding + replay-parity invariant is unit-tested in isolation.
+    """
+
+    def setup_method(self):
+        torch.manual_seed(1)
+        self.dev, self.dtype = "cuda", torch.float32
+        self.d, self.depth = 16, 3
+        self.buckets = [4, 8, 16]
+        self.ws = [
+            torch.randn(self.d, self.d, device=self.dev, dtype=self.dtype)
+            for _ in range(self.depth + 1)
+        ]
+        # Persistent static input buffer (max bucket); graph reads this address.
+        self.x_static = torch.zeros(
+            max(self.buckets), self.d, device=self.dev, dtype=self.dtype
+        )
+        self._captures: dict = {}
+        self._outputs: dict = {}
+        self._pool = None
+
+    def _inner(self, n):
+        """Inner forward over the leading ``n`` rows of the static buffer."""
+        h = self.x_static[:n] @ self.ws[0]
+        for i in range(self.depth):
+            dst = torch.empty_like(h)
+            h = break_here(torch.relu, dst, h)  # per-token "attention" break
+            h = h @ self.ws[i + 1]
+        return h
+
+    def _eager(self, x):
+        h = x @ self.ws[0]
+        for i in range(self.depth):
+            h = torch.relu(h)
+            h = h @ self.ws[i + 1]
+        return h
+
+    def _run_bucketed(self, n):
+        """Pad ``n`` up to a bucket, lazily capture/replay, return output[:n]."""
+        idx = next(i for i, b in enumerate(self.buckets) if b >= n)
+        bucket = self.buckets[idx]
+        cap = self._captures.get(bucket)
+        if cap is None:
+            for _ in range(2):  # warmup
+                self._inner(bucket)
+            torch.cuda.synchronize()
+            cap = BreakableCapture(pool=self._pool)
+            with cap:
+                out = self._inner(bucket)
+            self._pool = self._pool or cap.pool
+            cap.replay()  # capture doesn't execute; populate `out`
+            self._captures[bucket], self._outputs[bucket] = cap, out
+        else:
+            cap.replay()
+        return self._outputs[bucket][:n], bucket
+
+    def test_replay_matches_eager_across_buckets(self):
+        captured = set()
+        for n in [3, 4, 5, 8, 11, 16, 1]:
+            new_x = torch.randn(n, self.d, device=self.dev, dtype=self.dtype)
+            self.x_static.zero_()  # scrub the padded tail
+            self.x_static[:n].copy_(new_x)
+            out, bucket = self._run_bucketed(n)
+            captured.add(bucket)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                out, self._eager(new_x), msg=f"n={n}", rtol=1e-4, atol=1e-4
+            )
+        # First sighting of each distinct bucket captured once; later n replay.
+        assert (set(self._captures)) == ({4, 8, 16})
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
+class TestSharedHandoffStorage:
+    """Captures of different widths share handoff storage through ``handoff_storage``.
+
+    Each layer has two breaks whose outputs have the same width, different row
+    counts, and are read together by the next segment, so merging them into one
+    buffer inside a capture would corrupt the result.
+    """
+
+    def setup_method(self):
+        torch.manual_seed(3)
+        self.dev, self.dtype = "cuda", torch.float32
+        self.d = 16
+        self.w = torch.randn(self.d, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static = torch.zeros(8, self.d, device=self.dev, dtype=self.dtype)
+
+        class M:
+            @break_point
+            def whole(self, h):
+                return torch.relu(h)
+
+            @break_point
+            def half(self, h):
+                return h[: h.shape[0] // 2] * 2.0
+
+        self.m = M()
+
+    def _inner(self, n):
+        h = self.x_static[:n] @ self.w
+        a = self.m.whole(h)
+        b = self.m.half(h)
+        return a[: n // 2] + b
+
+    def _capture(self, n, storage, pool):
+        for _ in range(2):
+            self._inner(n)
+        torch.cuda.synchronize()
+        cap = BreakableCapture(pool=pool, handoff_storage=storage)
+        with cap:
+            out = self._inner(n)
+        return cap, out
+
+    def _check(self, captures, n):
+        cap, out = captures[n]
+        x = torch.randn(n, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static.zero_()
+        self.x_static[:n].copy_(x)
+        cap.replay()
+        torch.cuda.synchronize()
+        h = x @ self.w
+        expected = torch.relu(h)[: n // 2] + h[: n // 2] * 2.0
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+
+    def test_captures_share_storage_and_replay_like_eager(self):
+        for order in ([8, 4], [4, 8]):
+            storage, pool, captures = {}, None, {}
+            for n in order:
+                captures[n] = self._capture(n, storage, pool)
+                pool = pool or captures[n][0].pool
+            # One slot per distinct handoff of a capture, not per capture.
+            _pytest_first_7 = len(storage)
+            _pytest_second_8 = 2
+            _pytest_msg_9 = order
+            assert _pytest_first_7 == _pytest_second_8, _pytest_msg_9
+            for n in (8, 4, 8, 4):
+                self._check(captures, n)
+            if order == [8, 4]:
+                wide, narrow = (
+                    {t.data_ptr() for t in captures[n][0]._handoff.values()}
+                    for n in (8, 4)
+                )
+                assert (wide) == (narrow)
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
+class TestPrefillGraphSharedOutputs:
+    """PrefillGraph captures of two buckets share one output buffer and handoff map.
+
+    Replaying them alternately, including padded replays, must match eager over
+    the padded bucket exactly: a stale or aliased shared buffer would not.
+    """
+
+    def test_alternating_bucket_replays_match_eager(self):
+        from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+        torch.manual_seed(4)
+        dev, d = "cuda", 32
+        w1 = torch.randn(d, d, device=dev)
+        w2 = torch.randn(d, d, device=dev)
+        x_static = torch.zeros(16, d, device=dev)
+
+        class M:
+            @break_point
+            def attn(self, h):
+                return torch.tanh(h) * 3.0
+
+            @break_point
+            def half(self, h):
+                return h[: h.shape[0] // 2] + 1.0
+
+        m = M()
+
+        def inner(n):
+            h = x_static[:n] @ w1
+            a = m.attn(h)
+            b = m.half(h)
+            out = a.clone()
+            out[: n // 2] += b
+            return out, [a @ w2]
+
+        def eager(x):
+            h = x @ w1
+            a = torch.tanh(h) * 3.0
+            out = a.clone()
+            out[: x.shape[0] // 2] += h[: x.shape[0] // 2] + 1.0
+            return out, a @ w2
+
+        graph = PrefillGraph.__new__(PrefillGraph)
+        graph.num_warmup, graph._pool, graph._ctx = 2, None, None
+        graph.capture_buckets, graph.decoder_buckets = [8, 16], []
+        graph._narrowing, graph._outputs, graph._handoff_storage = None, None, {}
+        graph._run_inner = inner
+        with torch.inference_mode():
+            captures = {
+                bucket: PrefillGraph._capture_bucket(
+                    graph, bucket, None, contextlib.nullcontext()
+                )
+                for bucket in (16, 8)
+            }
+        for _cap, output in captures.values():
+            assert (output.hidden_states.data_ptr()) == (graph._outputs[0].data_ptr())
+            assert (output.aux_hidden_states[0].data_ptr()) == (
+                graph._outputs[1].data_ptr()
+            )
+        assert (len(graph._handoff_storage)) == (2)
+
+        # Serving replays under inference mode too; the breaks write inference tensors.
+        with torch.inference_mode():
+            for bucket, live in ((16, 16), (8, 8), (16, 16), (8, 5), (16, 12), (8, 8)):
+                x = torch.randn(live, d, device=dev)
+                x_static.zero_()
+                x_static[:live].copy_(x)
+                cap, output = captures[bucket]
+                cap.replay()
+                torch.cuda.synchronize()
+                hidden, aux = output.sliced(live)
+                padded = torch.zeros(bucket, d, device=dev)
+                padded[:live] = x
+                expected, tap = eager(padded)
+                torch.testing.assert_close(hidden, expected[:live], rtol=0, atol=0)
+                torch.testing.assert_close(aux[0], tap[:live], rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
+class TestBreakPointAndAmbientCtx:
+    """The ``@break_point`` decorator + ambient live-context rebind.
+
+    Exercises the two properties the model refactor relies on: (1) a decorated
+    method runs as an eager break under capture / a direct call otherwise, with
+    its output buffer sized from the named ``out`` arg; (2) the ForwardContext a
+    break reads is rebound to the LIVE ambient context at replay, so a graph
+    captured with a dummy ctx replays correctly against a different live ctx.
+    """
+
+    def setup_method(self):
+        torch.manual_seed(2)
+        self.dev, self.dtype = "cuda", torch.float32
+        self.d = 16
+        self.w0 = torch.randn(self.d, self.d, device=self.dev, dtype=self.dtype)
+        self.w1 = torch.randn(self.d, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static = torch.zeros(8, self.d, device=self.dev, dtype=self.dtype)
+
+    def test_passthrough_runs_method_when_not_capturing(self):
+        """Off the capture path @break_point always runs the method.
+
+        Including side effects and 0-row inputs -- the decorator never silently
+        skips a method; 0-row / idle handling is each model's own explicit
+        ``if hidden_states.shape[0] == 0`` guard.
+        """
+        calls = []
+
+        class M:
+            @break_point
+            def forward(self, x, ctx):
+                calls.append(x.shape[0])
+                return x * ctx.scale
+
+        m = M()
+        assert not (is_breakable_capture_active())
+        x = torch.randn(4, self.d, device=self.dev, dtype=self.dtype)
+        out = m.forward(x, SimpleNamespace(scale=3.0))  # direct call
+        torch.testing.assert_close(out, x * 3.0)
+        # 0 rows: the method still runs and its output (not the input) is returned.
+        empty = torch.zeros(0, self.d, device=self.dev, dtype=self.dtype)
+        out0 = m.forward(empty, SimpleNamespace(scale=9.0))
+        torch.testing.assert_close(out0, empty * 9.0)
+        assert (calls) == ([4, 0])  # method ran for both, including 0 rows
+
+    def test_ambient_ctx_rebinds_at_replay(self):
+        class M:
+            def __init__(self, w):
+                self.w = w
+
+            @break_point
+            def forward(self, x, ctx):
+                # Reads the (live) ctx; output [tokens, d] matches arg ``x``.
+                return torch.relu(x @ self.w) * ctx.scale
+
+        m = M(self.w1)
+        dummy = SimpleNamespace(scale=2.0)  # capture-time ctx
+        live = SimpleNamespace(scale=5.0)  # replay-time ctx
+
+        def outer():
+            h = self.x_static @ self.w0  # captured graph segment
+            return m.forward(h, dummy)  # eager break reading the ambient ctx
+
+        for _ in range(3):  # warmup
+            with active_forward(dummy):
+                outer()
+        torch.cuda.synchronize()
+        cap = BreakableCapture()
+        with active_forward(dummy):
+            with cap:
+                captured = outer()
+        # 1 break => 2 graph segments + 1 eager break.
+        assert (cap.num_segments) == (3)
+
+        new_x = torch.randn(8, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static.copy_(new_x)
+        with active_forward(live):  # replay against a DIFFERENT live ctx
+            cap.replay()
+        torch.cuda.synchronize()
+        # The break must have used live.scale (5.0), not the captured dummy (2.0).
+        expected = torch.relu((new_x @ self.w0) @ self.w1) * 5.0
+        torch.testing.assert_close(captured, expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    def test_dataclass_ctx_rebinds_at_replay(self, frozen):
+        """A ctx arg keeps its identity, so the break still rebinds it to the live
+        ctx at replay -- even a frozen dataclass whose every field is a tensor,
+        which a break would otherwise hold as a copy."""
+
+        @dataclasses.dataclass(frozen=frozen)
+        class Ctx:
+            scale: torch.Tensor
+
+        class M:
+            def __init__(self, w):
+                self.w = w
+
+            @break_point
+            def forward(self, x, ctx):
+                return torch.relu(x @ self.w) * ctx.scale
+
+        m = M(self.w1)
+        dummy = Ctx(scale=torch.full((), 2.0, device=self.dev))
+        live = Ctx(scale=torch.full((), 5.0, device=self.dev))
+
+        def outer():
+            return m.forward(self.x_static @ self.w0, dummy)
+
+        for _ in range(3):
+            with active_forward(dummy):
+                outer()
+        torch.cuda.synchronize()
+        cap = BreakableCapture()
+        with active_forward(dummy):
+            with cap:
+                captured = outer()
+        new_x = torch.randn(8, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static.copy_(new_x)
+        with active_forward(live):
+            cap.replay()
+        torch.cuda.synchronize()
+        expected = torch.relu((new_x @ self.w0) @ self.w1) * 5.0
+        torch.testing.assert_close(captured, expected, rtol=1e-4, atol=1e-4)
+
+    def test_break_reads_live_scalar_off_ambient_not_frozen_arg(self):
+        """Scalar args freeze at capture; live values must come off the ambient ctx.
+
+        Mirrors the hybrid attention-backend pattern: only the ambient ctx is
+        rebound at replay, so a break needing a live scalar (forward_mode, bs)
+        reads current_forward_ctx(), never its own frozen arg.
+        """
+        seen = {}
+
+        class M:
+            @break_point
+            def forward(self, x, frozen_mode):
+                amb = current_forward_ctx()
+                seen["frozen"] = frozen_mode
+                seen["live"] = amb.mode
+                return x * amb.mult
+
+        m = M()
+        dummy = SimpleNamespace(mode="EXTEND", mult=1.0)  # capture-time ctx
+        live = SimpleNamespace(mode="MIXED", mult=4.0)  # replay-time ctx
+
+        def outer():
+            h = self.x_static @ self.w0
+            return m.forward(h, frozen_mode="EXTEND")  # frozen scalar arg
+
+        for _ in range(3):
+            with active_forward(dummy):
+                outer()
+        torch.cuda.synchronize()
+        cap = BreakableCapture()
+        with active_forward(dummy):
+            with cap:
+                captured = outer()
+
+        new_x = torch.randn(8, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static.copy_(new_x)
+        with active_forward(live):  # replay against a DIFFERENT live ctx
+            cap.replay()
+        torch.cuda.synchronize()
+        # The positional/kw scalar arg stayed frozen at capture time...
+        assert (seen["frozen"]) == ("EXTEND")
+        # ...but the ambient read tracked the live ctx (mode + multiplier).
+        assert (seen["live"]) == ("MIXED")
+        torch.testing.assert_close(
+            captured, new_x @ self.w0 * 4.0, rtol=1e-4, atol=1e-4
+        )
+
+    def test_break_point_computed_out_shape(self):
+        """A NARROW break whose output shape matches no input (deepseek_v3 MLA-like)."""
+        d2 = self.d // 2
+        wv = torch.randn(self.d, d2, device=self.dev, dtype=self.dtype)
+
+        class M:
+            @break_point  # out-shape (d2 != input d) inferred from the actual output
+            def attn(self, x):  # output last-dim d2 != input last-dim d
+                return torch.relu(x) @ wv
+
+        m = M()
+
+        def outer():
+            h = self.x_static @ self.w0  # captured segment
+            return m.attn(h)  # narrow break, computed output shape
+
+        for _ in range(3):
+            outer()
+        torch.cuda.synchronize()
+        cap = BreakableCapture()
+        with cap:
+            captured = outer()
+        assert (tuple(captured.shape)) == ((self.x_static.size(0), d2))
+
+        new_x = torch.randn(8, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static.copy_(new_x)
+        cap.replay()
+        torch.cuda.synchronize()
+        expected = torch.relu(new_x @ self.w0) @ wv
+        torch.testing.assert_close(captured, expected, rtol=1e-4, atol=1e-4)
+
+    def test_nested_break_inner_passes_through(self):
+        """A broader @break_point overrides a nested one.
+
+        Capture is inactive while the outer break runs eagerly, so an inner
+        break called inside it passes straight through -- exactly one break.
+        """
+        seen = {"inner_active": None}
+
+        class M:
+            @break_point
+            def inner(self, x):  # would-be default backend break
+                seen["inner_active"] = is_breakable_capture_active()
+                return torch.relu(x)
+
+            @break_point
+            def outer(self, x):  # broader override break
+                return self.inner(x) @ self_w1  # noqa: F821
+
+        self_w1 = self.w1
+        m = M()
+
+        def fwd():
+            h = self.x_static @ self.w0  # captured segment
+            return m.outer(h)  # broad break; inner passes through
+
+        for _ in range(3):
+            fwd()
+        torch.cuda.synchronize()
+        cap = BreakableCapture()
+        with cap:
+            captured = fwd()
+        # Exactly one break (outer) => 2 graph segments + 1 break = 3.
+        assert (cap.num_segments) == (3)
+        assert (seen["inner_active"]) is (False)  # inner saw inactive capture
+
+        new_x = torch.randn(8, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static.copy_(new_x)
+        cap.replay()
+        torch.cuda.synchronize()
+        expected = torch.relu(new_x @ self.w0) @ self.w1
+        torch.testing.assert_close(captured, expected, rtol=1e-4, atol=1e-4)
+
+
+class TestPrefillTokenBuckets:
+    """Pure-function tests for the prefill-graph token-bucket schedule (no GPU)."""
+
+    @staticmethod
+    def _cfg(**overrides):
+        base = dict(
+            prefill_graph_max_tokens=2048,
+            disable_prefill_graph=False,
+            chunked_prefill_size=2048,
+            prefill_graph_capture_sizes=None,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_disabled(self):
+        from tokenspeed.runtime.execution.prefill_graph import (
+            get_prefill_token_buckets,
+        )
+
+        assert (get_prefill_token_buckets(self._cfg(prefill_graph_max_tokens=0))) == (
+            []
+        )
+        assert (get_prefill_token_buckets(self._cfg(disable_prefill_graph=True))) == (
+            []
+        )
+
+    def test_clamped_to_chunk(self):
+        from tokenspeed.runtime.execution.prefill_graph import (
+            get_prefill_token_buckets,
+        )
+
+        # No bucket above the chunk (see get_prefill_token_buckets for why).
+        buckets = get_prefill_token_buckets(
+            self._cfg(prefill_graph_max_tokens=8192, chunked_prefill_size=2048)
+        )
+        assert (buckets[-1]) == (2048)
+
+    def test_relative_ladder_properties(self):
+        from tokenspeed.runtime.execution.prefill_graph import (
+            get_prefill_token_buckets,
+        )
+
+        # Gaps bounded relatively (size/8) and absolutely (512); exact top; increasing.
+        for max_tokens in (8192, 2048, 1500):
+            buckets = get_prefill_token_buckets(
+                self._cfg(
+                    prefill_graph_max_tokens=max_tokens,
+                    chunked_prefill_size=max_tokens,
+                )
+            )
+            assert (buckets[-1]) == (max_tokens)
+            assert (buckets) == (sorted(set(buckets)))
+            gaps = [b2 - b1 for b1, b2 in zip(buckets, buckets[1:])]
+            for b1, g in zip(buckets, gaps):
+                _pytest_a_10 = g
+                _pytest_b_11 = 512
+                _pytest_msg_12 = f"cap violated at {b1}"
+                assert _pytest_a_10 <= _pytest_b_11, _pytest_msg_12
+                if b1 >= 256:
+                    _pytest_a_13 = g
+                    _pytest_b_14 = max(b1 // 8, 16)
+                    _pytest_msg_15 = f"relative bound at {b1}"
+                    assert _pytest_a_13 <= _pytest_b_14, _pytest_msg_15
+
+    def test_explicit_capture_sizes(self):
+        from tokenspeed.runtime.execution.prefill_graph import (
+            get_prefill_token_buckets,
+        )
+
+        # Explicit list overrides the ladder; clamped to max_tokens (always included).
+        buckets = get_prefill_token_buckets(
+            self._cfg(prefill_graph_capture_sizes=[256, 1024, 4096])
+        )
+        assert (buckets) == ([256, 1024, 2048])
+
+
+class TestPrefillGraphMaxTokensResolution:
+    """Which server args switch the prefill graph off entirely."""
+
+    @staticmethod
+    def _args(**overrides):
+        base = dict(
+            prefill_graph_max_tokens=None,
+            chunked_prefill_size=8192,
+            max_total_tokens=None,
+            all2all_backend="none",
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_default_ceiling(self):
+        from tokenspeed.runtime.execution.model_executor import (
+            PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
+            _resolve_prefill_graph_max_tokens,
+        )
+
+        assert (_resolve_prefill_graph_max_tokens(self._args())) == (
+            PREFILL_GRAPH_DEFAULT_MAX_TOKENS
+        )
+
+    def test_k3_transports_keep_prefill_graphs(self, subtests):
+        from tokenspeed.runtime.execution.model_executor import (
+            PREFILL_GRAPH_DEFAULT_MAX_TOKENS,
+            _resolve_prefill_graph_max_tokens,
+        )
+
+        for backend in ("agrs", "flashinfer"):
+            with subtests.test(backend=backend):
+                assert (
+                    _resolve_prefill_graph_max_tokens(
+                        self._args(all2all_backend=backend)
+                    )
+                ) == (PREFILL_GRAPH_DEFAULT_MAX_TOKENS)
+                assert (
+                    _resolve_prefill_graph_max_tokens(
+                        self._args(
+                            all2all_backend=backend, prefill_graph_max_tokens=1024
+                        )
+                    )
+                ) == (1024)
+
+    def test_deepep_disables_the_graph(self):
+        from tokenspeed.runtime.execution.model_executor import (
+            _resolve_prefill_graph_max_tokens,
+        )
+
+        # DeepEP's normal dispatch reports per-expert receive counts to the host,
+        # and a host sync cannot be captured -- even when asked for explicitly.
+        assert (
+            _resolve_prefill_graph_max_tokens(self._args(all2all_backend="deepep"))
+        ) == (0)
+        assert (
+            _resolve_prefill_graph_max_tokens(
+                self._args(all2all_backend="deepep", prefill_graph_max_tokens=2048)
+            )
+        ) == (0)
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
+class TestWeakRefTensor:
+    """The non-owning-view op behind break-closure weak refs."""
+
+    def test_alias_without_ownership(self):
+        from tokenspeed.runtime.execution.breakable_cuda_graph import weak_ref_tensor
+
+        x = torch.arange(12, device="cuda", dtype=torch.float32).view(3, 4)[:, 1:]
+        w = weak_ref_tensor(x)
+        if w is x:  # identity fallback (no C++ toolchain) -- still correct
+            pytest.skip("weak_ref extension unavailable; identity fallback")
+        # Aliases the same memory (incl. strides), sees writes, owns nothing.
+        assert (w.data_ptr()) == (x.data_ptr())
+        assert (w.stride()) == (x.stride())
+        x.fill_(3.0)
+        torch.cuda.synchronize()
+        assert bool((w == 3.0).all())
+        # Non-tensor / CPU passthrough.
+        assert (weak_ref_tensor(None)) is None
+        cpu = torch.ones(2)
+        assert (weak_ref_tensor(cpu)) is (cpu)
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
+class TestPoolReuseAcrossCaptures:
+    """Graph-pool memory must NOT grow per capture (the dense-ladder enabler).
+
+    Allocator pool blocks are stream-keyed, so all BreakableCaptures must share
+    one capture stream (class-level default) -- a fresh stream per capture makes
+    pool memory grow with the SUM of bucket sizes instead of the max. Break
+    closures must also not own their tensor args (bare, or in a frozen
+    dataclass of tensors), or each capture keeps every layer's break inputs.
+    """
+
+    @staticmethod
+    def _pool_mb():
+        return (
+            sum(
+                s["total_size"]
+                for s in torch.cuda.memory_snapshot()
+                if s.get("segment_pool_id", (0, 0)) != (0, 0)
+            )
+            / 2**20
+        )
+
+    def test_same_and_smaller_captures_reuse_pool(self):
+        d, d2, depth = 512, 2048, 4
+        w1 = torch.randn(d, d2, device="cuda")
+        w2 = torch.randn(d2, d, device="cuda")
+        xbuf = torch.zeros(4096, d, device="cuda")
+
+        def fwd(n):
+            x = xbuf[:n]
+            for _ in range(depth):
+                h = x @ w1
+                dst = torch.empty_like(h)
+                h = break_here(torch.relu, dst, h)
+                x = h @ w2
+            return x
+
+        pool = torch.cuda.graph_pool_handle()
+        caps = []
+        deltas = []
+        for n in (4096, 2048, 4096):
+            for _ in range(2):
+                fwd(n)
+            torch.cuda.synchronize()
+            before = self._pool_mb()
+            cap = BreakableCapture(pool=pool)  # shared default capture stream
+            with cap:
+                out = fwd(n)
+            cap.replay()
+            torch.cuda.synchronize()
+            caps.append((cap, out))
+            deltas.append(self._pool_mb() - before)
+        # First capture claims ~peak-live; later ones must reuse it (small allowance).
+        _pytest_a_1 = deltas[1]
+        _pytest_b_2 = max(2.0, deltas[0] * 0.1)
+        _pytest_msg_3 = f"deltas={deltas}"
+        assert _pytest_a_1 < _pytest_b_2, _pytest_msg_3
+        _pytest_a_4 = deltas[2]
+        _pytest_b_5 = max(2.0, deltas[0] * 0.1)
+        _pytest_msg_6 = f"deltas={deltas}"
+        assert _pytest_a_4 < _pytest_b_5, _pytest_msg_6
+        # Replays still valid after cross-capture reuse.
+        for cap, _ in caps:
+            cap.replay()
+        torch.cuda.synchronize()
+
+    def test_tensor_bundle_break_args_reuse_pool(self):
+        """A frozen dataclass of segment outputs passed to a break (MLA's
+        prologue output) must not pin its tensors, exactly like a bare tensor
+        arg: otherwise every capture keeps its own copy of each layer's
+        bundle and pool memory grows with the sum of the buckets."""
+        from tokenspeed_kernel.ops.attention.prologue import MLAPrologueOutput
+
+        from tokenspeed.runtime.execution.breakable_cuda_graph import weak_ref_tensor
+
+        probe = torch.empty(1, device="cuda")
+        if weak_ref_tensor(probe) is probe:
+            pytest.skip("weak_ref extension unavailable; identity fallback")
+        torch.manual_seed(3)
+        d, d2, depth = 512, 2048, 4
+        w1 = torch.randn(d, d2, device="cuda") * 0.02
+        w2 = torch.randn(d2, d, device="cuda") * 0.02
+        xbuf = torch.zeros(4096, d, device="cuda")
+        # Outputs land outside the pool, as PrefillGraph's do.
+        outbuf = torch.empty(4096, d, device="cuda")
+
+        class Attention:
+            @break_point
+            def forward(self, x, ctx, *, expanded):
+                return torch.relu(expanded.query) + expanded.key
+
+        attn = Attention()
+
+        def fwd(n):
+            x = xbuf[:n]
+            for _ in range(depth):
+                q = x @ w1
+                expanded = MLAPrologueOutput(query=q, key=q * 2.0, value=None)
+                x = attn.forward(x, None, expanded=expanded) @ w2
+            return outbuf[:n].copy_(x)
+
+        def eager(x):
+            for _ in range(depth):
+                q = x @ w1
+                x = (torch.relu(q) + q * 2.0) @ w2
+            return x
+
+        pool = torch.cuda.graph_pool_handle()
+        handoff_storage = {}
+        caps = []
+        deltas = []
+        for n in (4096, 2048, 4096):
+            for _ in range(2):
+                fwd(n)
+            torch.cuda.synchronize()
+            before = self._pool_mb()
+            cap = BreakableCapture(pool=pool, handoff_storage=handoff_storage)
+            with cap:
+                fwd(n)
+            torch.cuda.synchronize()
+            caps.append((n, cap))
+            deltas.append(self._pool_mb() - before)
+        # Pinned bundles would add depth x 2 x n x d2 floats per capture; with
+        # weak refs the later captures reuse the pool (allocator fragmentation
+        # may still add a block), so together they grow by less than the
+        # bundles of a single 2048-token capture.
+        pinned_2048_mib = depth * 2 * 2048 * d2 * 4 / 2**20
+        assert deltas[1] + deltas[2] < pinned_2048_mib, f"deltas={deltas}"
+        # Replays stay exact after reuse within and across captures.
+        for n, cap in caps:
+            xbuf[:n].copy_(torch.randn(n, d, device="cuda"))
+            cap.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(outbuf[:n], eager(xbuf[:n]))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

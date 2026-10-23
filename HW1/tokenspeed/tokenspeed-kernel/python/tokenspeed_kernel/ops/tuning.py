@@ -1,0 +1,456 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Kernel startup tuning and FlashInfer-native cache persistence."""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import logging
+import os
+import tempfile
+from collections.abc import Generator
+from pathlib import Path
+
+import torch.distributed as dist
+
+try:
+    import flashinfer.autotuner as _autotuner
+except ImportError:
+    _autotuner = None
+
+__all__ = [
+    "autotune",
+    "autotune_cache_path",
+    "get_autotune_max_num_tokens",
+    "is_autotuning",
+    "load_autotune_cache",
+    "save_autotune_cache",
+    "set_autotune_max_num_tokens",
+    "set_autotune_process_group",
+    "untuned",
+]
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_AUTOTUNE_MAX_NUM_TOKENS = 8192
+_AUTOTUNE_CACHE_DIR_ENV = "TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR"
+
+_autotune_max_num_tokens = _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
+_autotune_process_group: dist.ProcessGroup | None = None
+
+
+@contextlib.contextmanager
+def _reuse_autotune_cache():
+    """Reuse serving entries while preserving explicit cache lookup policies."""
+    # Legacy bundled entries are not validated or included in saved configs.
+    if os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE") == "1":
+        yield
+        return
+    AutoTuner = _autotuner.AutoTuner
+    original_search = AutoTuner.search_cache
+
+    def search(
+        tuner,
+        custom_op,
+        runners,
+        input_shapes,
+        tuning_config,
+        inputs=None,
+        *,
+        require_profiling_policy: bool = False,
+    ):
+        with tuner._lock:
+            # FI 0.7 skips persisted entries for cold-L2 tuning. Use serving
+            # lookup rules, then restore tuning so cache misses still profile.
+            # Preserve explicit require_profiling_policy for managed and
+            # in-memory entries, even while the implicit tuning flag is off.
+            was_tuning = tuner.is_tuning_mode
+            tuner.is_tuning_mode = False
+            try:
+                result = original_search(
+                    tuner,
+                    custom_op,
+                    runners,
+                    input_shapes,
+                    tuning_config,
+                    inputs=inputs,
+                    require_profiling_policy=require_profiling_policy,
+                )
+            finally:
+                tuner.is_tuning_mode = was_tuning
+            hit, runner_id, tactic, _ = result
+            if (
+                was_tuning
+                and hit
+                and not tuner._blocklist.filter(custom_op, runners[runner_id], [tactic])
+            ):
+                hit = False
+            if was_tuning and _autotune_process_group is not None:
+                hits = [False] * dist.get_world_size(_autotune_process_group)
+                dist.all_gather_object(hits, hit, group=_autotune_process_group)
+                hit = all(hits)
+            # Rank-specific keys can miss even after loading identical files.
+            return result if hit else (False, 0, -1, None)
+
+    AutoTuner.search_cache = search
+    try:
+        yield
+    finally:
+        AutoTuner.search_cache = original_search
+
+
+@contextlib.contextmanager
+def _ep_moe_candidates():
+    AutoTuner = _autotuner.AutoTuner
+
+    original_choose = AutoTuner.choose_one
+
+    def expand_tactics(original):
+        def get_valid(self, tensors, profile):
+            from flashinfer.fused_moe.core import MoeRunnerInputs
+
+            native = list(original(self, tensors, profile))
+            total, local = self.num_experts, self.num_local_experts
+            if total <= local or total % local or self.num_fused_shared_experts:
+                return native
+            index = MoeRunnerInputs.idx("hidden_states")
+            tokens = tensors[index].shape[0]
+            effective = (tokens * local + total - 1) // total
+            if effective == tokens:
+                return native
+            # This view is used only for enumeration, never for profiling.
+            shaped = list(tensors)
+            shaped[index] = tensors[index][:effective]
+            seen = {tuple(tactic) for tactic in native}
+            for tactic in original(self, shaped, profile):
+                key = tuple(tactic)
+                if key not in seen:
+                    native.append(tactic)
+                    seen.add(key)
+            return native
+
+        return get_valid
+
+    def choose(tuner, custom_op, runners, tuning_config, inputs, **kwargs):
+        if custom_op != "flashinfer::trtllm_fp4_block_scale_moe":
+            return original_choose(
+                tuner, custom_op, runners, tuning_config, inputs, **kwargs
+            )
+        with tuner._lock:
+            # FlashInfer's FP4 MoE operation has a single MoERunner.
+            runner_type = type(runners[0])
+            original = runner_type.get_valid_tactics
+            runner_type.get_valid_tactics = expand_tactics(original)
+            try:
+                return original_choose(
+                    tuner, custom_op, runners, tuning_config, inputs, **kwargs
+                )
+            finally:
+                runner_type.get_valid_tactics = original
+
+    AutoTuner.choose_one = choose
+    try:
+        yield
+    finally:
+        AutoTuner.choose_one = original_choose
+
+
+def autotune_cache_path(cache_key: dict[str, object]) -> str | None:
+    """Build a cache path from model/layout facts and FlashInfer metadata.
+
+    Args:
+        cache_key: JSON-serializable model, backend, and parallel-layout facts.
+
+    Returns:
+        Cache filename, or None when FlashInfer is unavailable.
+    """
+    if _autotuner is None:
+        return None
+
+    payload = {
+        "config": cache_key,
+        "environment": _autotuner._collect_metadata(),
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:24]
+    root = os.environ.get(_AUTOTUNE_CACHE_DIR_ENV)
+    if not root:
+        cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+        root = os.path.join(cache_home, "tokenspeed", "flashinfer-autotune")
+    return os.path.join(root, digest, "autotune_configs.json")
+
+
+def set_autotune_max_num_tokens(num_tokens: int) -> None:
+    """Set the token count MoE tuning buckets are generated up to.
+
+    Call once at startup, before :func:`autotune` is first entered. The value must stay
+    constant for the process lifetime: flashinfer builds the bucket *mapper*
+    from it and consults that mapper on every serving call to compute the
+    tactic cache key, so a value derived from the current batch makes lookups
+    resolve to the wrong bucket.
+
+    Args:
+        num_tokens: Largest token count a single forward can carry (the
+            runtime's ``chunked_prefill_size``). Raised to flashinfer's own
+            default floor when smaller.
+    """
+    global _autotune_max_num_tokens
+    _autotune_max_num_tokens = max(int(num_tokens), _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS)
+
+
+def get_autotune_max_num_tokens() -> int:
+    """Token count MoE tuning buckets are generated up to.
+
+    Returns:
+        The value set by :func:`set_autotune_max_num_tokens`, or the default floor.
+    """
+    return _autotune_max_num_tokens
+
+
+@contextlib.contextmanager
+def autotune(
+    *,
+    tune_mode: bool,
+    tuning_buckets: tuple[int, ...] | None,
+    round_up: bool | None,
+) -> Generator[None]:
+    """Enable kernel autotuning for the enclosed block, process-wide.
+
+    Kernels invoked inside the block profile their candidate tactics and cache
+    the winner per shape bucket; outside it they are a cache lookup with a
+    heuristic fallback. A no-op when the tuning backend is unavailable.
+
+    Args:
+        tune_mode: Profile missing configs when true; lookup only when false.
+        tuning_buckets: Explicit token counts overriding the native buckets.
+        round_up: How inputs between explicit buckets map to them.
+
+    Yields:
+        ``None``; tuning is disabled again when the block exits, including on
+        error.
+    """
+    if _autotuner is None:
+        yield
+        return
+    if tune_mode:
+        # FI 0.6.18: TGV tactics 16-28 are 2-CTA and can fail during replay.
+        # The heuristic uses 1-CTA tactic 1. Keep this blocklist after tuning.
+        tuner = _autotuner.AutoTuner.get()
+        tuner._blocklist._invalid.setdefault("bf16_gemm::TGVRunner", set()).update(
+            range(16, 29)
+        )
+    candidates = _ep_moe_candidates() if tune_mode else contextlib.nullcontext()
+    cache = _reuse_autotune_cache() if tune_mode else contextlib.nullcontext()
+    with cache, candidates, _autotuner.autotune(
+        tune_mode, tuning_buckets=tuning_buckets, round_up=round_up
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def untuned(*ops: str) -> Generator[None]:
+    """Use cached or heuristic tactics for ``ops`` in the block, even inside an
+    enclosing tuning block (FlashInfer ``custom_op`` names).
+
+    Args:
+        ops: Operations that must not be profiled here.
+
+    Yields:
+        ``None``; the enclosing tuning mode applies again on exit.
+    """
+    if _autotuner is None:
+        yield
+        return
+    with _autotuner.autotune(False, skip_ops=set(ops)):
+        yield
+
+
+def set_autotune_process_group(process_group) -> None:
+    """Average per-tactic profile timings across ``process_group`` ranks.
+
+    Ranks must profile the same ops in the same order. Cache hits are agreed
+    across the group. Clear the group after tuning. A no-op without FlashInfer.
+
+    Args:
+        process_group: A ``torch.distributed`` process group covering the
+            ranks that tune together (prefer a CPU/gloo group), or ``None``
+            to restore independent per-rank tuning.
+    """
+    global _autotune_process_group
+    _autotune_process_group = process_group
+    if _autotuner is not None:
+        _autotuner.set_autotune_process_group(process_group)
+
+
+def _install_autotune_cache_bytes(path: str, payload: bytes) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Multiple local ranks share the path; readers must see a complete file.
+    tmp = tempfile.NamedTemporaryFile(dir=target.parent, delete=False)
+    try:
+        with tmp:
+            tmp.write(payload)
+        os.replace(tmp.name, target)
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
+
+
+def _mirror_autotune_cache(
+    path: str,
+    payload: bytes | None,
+    process_group: dist.ProcessGroup | None,
+    owner_rank: int,
+) -> bool:
+    if process_group is not None:
+        payload_box = [payload]
+        dist.broadcast_object_list(payload_box, src=owner_rank, group=process_group)
+        payload = payload_box[0]
+    if payload is None:
+        return False
+    try:
+        _install_autotune_cache_bytes(path, payload)
+    except OSError:
+        logger.warning(f"Could not mirror FlashInfer cache to {path}", exc_info=True)
+        return False
+    return True
+
+
+def _autotuner_available(process_group: dist.ProcessGroup | None) -> bool:
+    available = _autotuner is not None
+    if process_group is not None:
+        rank_states = [False] * dist.get_world_size(process_group)
+        dist.all_gather_object(rank_states, available, group=process_group)
+        if any(rank_states) and not all(rank_states):
+            raise RuntimeError("FlashInfer availability differs across tuning ranks")
+    return available
+
+
+def load_autotune_cache(
+    path: str | None,
+    process_group: dist.ProcessGroup | None,
+    owner_rank: int,
+) -> bool:
+    """Load the owner's cache consistently without rewriting existing files.
+
+    Args:
+        path: Local cache filename, or None to start without a cache.
+        process_group: CPU group sharing tactics, or None for a single rank.
+        owner_rank: Global rank whose file is authoritative.
+
+    Returns:
+        Whether every rank loaded the cache. Otherwise all ranks tune cold.
+    """
+    if not _autotuner_available(process_group):
+        return False
+    try:
+        tuner = _autotuner.AutoTuner.get()
+        tuner.clear_cache()
+    except Exception:
+        if process_group is not None:
+            raise
+        logger.warning("Could not initialize FlashInfer autotune cache", exc_info=True)
+        return False
+    loaded = False
+    if path is not None:
+        payload = None
+        is_owner = process_group is None or dist.get_rank() == owner_rank
+        if is_owner:
+            try:
+                payload = Path(path).read_bytes()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning(f"Could not read FlashInfer cache {path}", exc_info=True)
+        if process_group is not None:
+            payload_box = [payload]
+            dist.broadcast_object_list(payload_box, src=owner_rank, group=process_group)
+            payload = payload_box[0]
+        if payload is not None:
+            try:
+                # All ranks load the broadcast bytes; a rewrite cannot split them.
+                with tempfile.NamedTemporaryFile() as tmp:
+                    tmp.write(payload)
+                    tmp.flush()
+                    loaded = bool(tuner.load_configs(tmp.name))
+            except Exception:
+                logger.warning(f"Could not load FlashInfer cache {path}", exc_info=True)
+    if process_group is not None:
+        rank_states = [False] * dist.get_world_size(process_group)
+        dist.all_gather_object(rank_states, loaded, group=process_group)
+        loaded = all(rank_states)
+    if loaded:
+        logger.info(f"loaded FlashInfer autotune cache from {path}")
+    else:
+        # Partial loads must not let ranks enter different timing collectives.
+        tuner.clear_cache()
+    return loaded
+
+
+def save_autotune_cache(
+    path: str | None,
+    process_group: dist.ProcessGroup | None,
+    owner_rank: int,
+) -> bool:
+    """Save the owner's merged tactics and mirror the resulting file to peers.
+
+    Args:
+        path: Local cache filename, or None to skip persistence.
+        process_group: CPU group sharing tactics, or None for a single rank.
+        owner_rank: Global rank that writes the cache.
+
+    Returns:
+        Whether the saved cache was installed locally. Write failures are logged.
+    """
+    if path is None:
+        return False
+    if not _autotuner_available(process_group):
+        return False
+    payload = None
+    try:
+        with tempfile.NamedTemporaryFile() as tmp:
+            _autotuner.AutoTuner.get().save_configs(tmp.name)
+            payload = Path(tmp.name).read_bytes()
+    except Exception:
+        logger.warning(f"Could not save FlashInfer cache {path}", exc_info=True)
+    if process_group is not None:
+        payloads = [None] * dist.get_world_size(process_group)
+        dist.all_gather_object(payloads, payload, group=process_group)
+        payload = None
+        if dist.get_rank() == owner_rank and all(p is not None for p in payloads):
+            try:
+                # MoE cache keys include TP/EP rank: keep every rank's entries.
+                merged = {}
+                for rank_payload in payloads:
+                    merged.update(json.loads(rank_payload))
+                payload = json.dumps(merged).encode()
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"Could not merge FlashInfer cache {path}", exc_info=True
+                )
+    return _mirror_autotune_cache(path, payload, process_group, owner_rank)
+
+
+def is_autotuning() -> bool:
+    """Whether FlashInfer may profile missing choices in the current context."""
+    return _autotuner is not None and _autotuner.AutoTuner.get().is_tuning_mode

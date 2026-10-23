@@ -1,0 +1,266 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Sampling parameters for text generation."""
+
+import copy
+import zlib
+from typing import Any
+
+import msgspec
+
+_SAMPLING_EPS = 1e-6
+
+# Sentinel for "top_k is disabled" (sample from whole vocab). We rewrite
+# top_k=-1 (API convention) to this value so downstream code can pass it
+# unchanged to top_k kernels that expect a positive cutoff.
+_TOP_K_DISABLED = 1 << 30
+
+# Upper bound the fused top-k + top-p kernel sorts in its on-chip top-K
+# branch. Requests with a finite top_k above this would silently fall through
+# to the top-p-only branch, so reject them at request time. Must stay in sync
+# with K_TOPK_MAX in fused_topk_topp.h.
+_TOP_K_FUSED_MAX = 128
+
+
+class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
+    """
+    The sampling parameters.
+
+    A ``msgspec.Struct`` so it rides engine IPC as a compact positional
+    msgpack array nested inside the tokenized request. Field ORDER is the
+    wire contract — append new fields at the end, never reorder.
+
+    ``__post_init__`` (run on both construction and msgpack decode) applies
+    the API-input normalization the old ``__init__`` performed; the
+    ``is_normalized`` guard keeps a decode from re-deriving fields that
+    ``normalize()`` already resolved on the sending process.
+
+    See docs/backend/sampling_params.md or
+    https://docs.tokenspeed.ai/backend/sampling_params.html
+    for the documentation.
+    """
+
+    # --- API parameters (set by callers) ---
+    max_new_tokens: int | None = None
+    # API input alias: copied to ``stop_strs`` by ``__post_init__``.
+    stop: str | list[str] | None = None
+    stop_token_ids: set[int] | None = None
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = -1
+    min_p: float = 0.0
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    min_new_tokens: int = 0
+    json_schema: str | None = None
+    regex: str | None = None
+    ebnf: str | None = None
+    structural_tag: str | None = None
+    ignore_eos: bool = False
+    skip_special_tokens: bool = True
+    spaces_between_special_tokens: bool = True
+    no_stop_trim: bool = False
+    thinking_budget: int | None = None
+    custom_params: dict[str, Any] | None = None
+    stream_interval: int | None = None
+    logit_bias: dict[str, float] | None = None
+    seed: int | None = None
+    # Output logprobs. None = off; 0 = the sampled (generated) token's
+    # logprob at each output position. Other values are rejected by verify().
+    logprobs: int | None = None
+    # OpenAI-compat: `n` is a request-level fanout (number of choices)
+    # that the serving layer forwards on every sampling_params dict.
+    # TokenSpeed does not multiplex a single request into n completions;
+    # the value is stored (transports validate n == 1) but never acted on.
+    n: int = 1
+
+    # --- Internal fields (populated by __post_init__ / normalize()) ---
+    stop_strs: str | list[str] | None = None  # from ``stop``
+    stop_str_max_len: int = 0  # set by normalize()
+    is_normalized: bool = False  # set by normalize()
+
+    def __post_init__(self) -> None:
+        # Runs after msgpack decode too; once normalize() resolved the
+        # derived fields on the sender, do not re-derive them here.
+        if self.is_normalized:
+            return
+
+        self.stop_strs = self.stop
+        if self.stop_token_ids:
+            self.stop_token_ids = set(self.stop_token_ids)
+        else:
+            self.stop_token_ids = None
+
+        # Process some special cases
+        if self.temperature < _SAMPLING_EPS:
+            self.temperature = 1.0
+            self.top_k = 1
+        if self.top_k == 1:
+            # top_k = 1 means greedy sampling — whether it came from a
+            # near-zero temperature or the caller asked for it directly.
+            # Greedy ignores randomness by definition, so pin the seed: the
+            # unified pool route breaks exact-tie logits with the request's
+            # random stream, and a request-derived seed would make two
+            # identical greedy requests disagree on tied tokens
+            # (dummy-weight tests hit ties routinely; bf16 serving can too).
+            self.seed = 0
+        if self.top_k == -1:
+            self.top_k = _TOP_K_DISABLED
+
+    def verify(self, vocab_size: int) -> None:
+        if self.temperature < 0.0:
+            raise ValueError(
+                f"temperature must be non-negative, got {self.temperature}."
+            )
+        if not 0.0 < self.top_p <= 1.0:
+            raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
+        if not 0.0 <= self.min_p <= 1.0:
+            raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
+        if self.top_k < -1 or self.top_k == 0:
+            raise ValueError(
+                f"top_k must be -1 (disable), or at least 1, " f"got {self.top_k}."
+            )
+        if self.top_k != _TOP_K_DISABLED and self.top_k >= _TOP_K_FUSED_MAX:
+            raise ValueError(
+                f"top_k must be < {_TOP_K_FUSED_MAX} (fused kernel limit) "
+                f"or -1 (disable), got {self.top_k}."
+            )
+        if not -2.0 <= self.frequency_penalty <= 2.0:
+            raise ValueError(
+                "frequency_penalty must be in [-2, 2], got "
+                f"{self.frequency_penalty}."
+            )
+        if not -2.0 <= self.presence_penalty <= 2.0:
+            raise ValueError(
+                "presence_penalty must be in [-2, 2], got " f"{self.presence_penalty}."
+            )
+        if not 0.0 < self.repetition_penalty <= 2.0:
+            raise ValueError(
+                "repetition_penalty must be in (0, 2], got "
+                f"{self.repetition_penalty}."
+            )
+        if not 0 <= self.min_new_tokens:
+            raise ValueError(
+                f"min_new_tokens must be in (0, max_new_tokens], got "
+                f"{self.min_new_tokens}."
+            )
+        if self.max_new_tokens is not None:
+            if self.max_new_tokens < 0:
+                raise ValueError(
+                    f"max_new_tokens must be at least 0, got {self.max_new_tokens}."
+                )
+            if not self.min_new_tokens <= self.max_new_tokens:
+                raise ValueError(
+                    f"min_new_tokens must be in (0, max_new_tokens({self.max_new_tokens})], got "
+                    f"{self.min_new_tokens}."
+                )
+        if self.logit_bias is not None:
+            for token_id in self.logit_bias:
+                if not 0 <= int(token_id) < vocab_size:
+                    raise ValueError(
+                        f"logit_bias must has keys in [0, {vocab_size - 1}], got "
+                        f"{token_id}."
+                    )
+
+        if self.logprobs is not None and self.logprobs != 0:
+            # Only the sampled token's logprob (logprobs=0) is materialized;
+            # top-k (>0) and full-vocab (-1) output logprobs are not supported.
+            raise ValueError(
+                f"logprobs={self.logprobs} is not supported; use logprobs=0 "
+                "(the sampled token's logprob)."
+            )
+
+        grammars = [
+            self.json_schema,
+            self.regex,
+            self.ebnf,
+        ]  # since mutually exclusive, only one can be set
+        if sum(x is not None for x in grammars) > 1:
+            raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
+
+    def requested_features(self) -> "set[str]":
+        """Return the set of backend-facing feature names this request needs.
+
+        `temperature`, `top_k`, `top_p`, `min_p` each appear only when the
+        corresponding field is not at its neutral default. Used by
+        SamplingBackend.register() to reject requests asking for features
+        the active backend does not implement."""
+        out: set[str] = set()
+        if abs(self.temperature - 1.0) > _SAMPLING_EPS:
+            out.add("temperature")
+        # top_k=_TOP_K_DISABLED and top_k=1 (greedy short-circuit from __post_init__) are neutral.
+        if self.top_k != _TOP_K_DISABLED and self.top_k != 1:
+            out.add("top_k")
+        if self.top_p < 1.0:
+            out.add("top_p")
+        if self.min_p > 0.0:
+            out.add("min_p")
+        if self.frequency_penalty != 0.0:
+            out.add("frequency_penalty")
+        if self.presence_penalty != 0.0:
+            out.add("presence_penalty")
+        if self.repetition_penalty != 1.0:
+            out.add("repetition_penalty")
+        if self.logit_bias:
+            out.add("logit_bias")
+        return out
+
+    def resolve_seed(self, rid: str) -> None:
+        """If the caller didn't supply a seed, derive one deterministically
+        from rid. Called at the single request-materialization point so all
+        TP/DP ranks agree on the seed."""
+        if self.seed is None:
+            self.seed = zlib.crc32(rid.encode("utf-8")) & 0xFFFFFFFF
+
+    def for_parallel_sample(self, replica_index: int) -> "SamplingParams":
+        """Copy of these params for replica ``replica_index`` of an n > 1 request.
+
+        All replicas start from the same resolved seed, and some backends
+        (e.g. triton) sample from (seed, position) only, so without an offset
+        every replica returns the same tokens. Greedy requests keep their
+        pinned seed.
+        """
+        if self.seed is None:
+            raise ValueError("resolve_seed() must run before fan-out.")
+        replica = copy.copy(self)
+        if replica.top_k != 1:
+            replica.seed = self.seed + replica_index
+        return replica
+
+    def normalize(self, tokenizer) -> None:
+        # Process stop strings
+        if self.stop_strs is None:
+            self.stop_strs = []
+            self.stop_str_max_len = 0
+        else:
+            if isinstance(self.stop_strs, str):
+                self.stop_strs = [self.stop_strs]
+
+            stop_str_max_len = 0
+            for stop_str in self.stop_strs:
+                if tokenizer is not None:
+                    stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
+                    stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
+                else:
+                    stop_str_max_len = max(stop_str_max_len, len(stop_str))
+            self.stop_str_max_len = stop_str_max_len
+        self.is_normalized = True

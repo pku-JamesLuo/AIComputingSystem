@@ -1,0 +1,2120 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Dense16 Gluon GEMM kernels for gfx950.
+
+The launchers compute ``A @ B.T`` (or batched ``A @ B``) for 16-bit
+floating-point inputs; ``tokenspeed-kernel`` selects among them by shape.
+"""
+
+from __future__ import annotations
+
+import torch
+from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
+    _dense16_mm_launch_metadata,
+)
+from tokenspeed_kernel_amd.ops.gfx950.gemm.splitk import check_splitk_counters
+
+cdna4 = gl.amd.cdna4
+async_copy = gl.amd.cdna4.async_copy
+
+DENSE16_BLOCK_M = 16
+DENSE16_BLOCK_N = 128
+DENSE16_BLOCK_K = 64
+BMM_M1_BLOCK_N = 32
+BMM_M1_NUM_WARPS = 4
+CDNA_WAVEFRONT_SIZE = 64
+MFMA_LDS_BLOCK_N = 256
+MFMA_LDS_BLOCK_K = 64
+MFMA_LDS_NUM_WARPS = 4
+MFMA_LDS_REDUCE_M = 4
+MFMA_LDS_SPLIT_K = 8
+GROUP_SIZE_M = 2
+MAX_M = 1024
+
+_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
+_partial_cache: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
+
+
+def _dense16_bmm_launch_metadata(grid, kernel, args):
+    """Report the fixed-M=1 batched GEMM work and tensor traffic."""
+    n, k = args["N"], args["K"]
+    batch = grid[0] * args["BLOCK_N"] // n
+    return {
+        "name": kernel.name,
+        "flops16": 2 * batch * n * k,
+        "bytes": batch * k * args["a_ptr"].element_size()
+        + batch * n * k * args["b_ptr"].element_size()
+        + batch * n * args["output_ptr"].element_size(),
+    }
+
+
+def _dense16_splitk_launch_metadata(grid, kernel, args):
+    """Report split-K producer work, including FP32 partial traffic."""
+    m, n = args["M"], args["N"]
+    split_k = args["SPLIT_K"]
+    k = args["K_TILES_PER_SPLIT"] * args["BLOCK_K"] * split_k
+    partial_values = n * args["PARTIAL_M"] * split_k
+    return {
+        "name": kernel.name,
+        "flops16": 2 * m * n * k,
+        "bytes": m * k * args["a_ptr"].element_size()
+        + n * k * args["b_ptr"].element_size()
+        + partial_values * args["partial_ptr"].element_size(),
+    }
+
+
+def _dense16_splitk_reduce_launch_metadata(grid, kernel, args):
+    """Report FP32 partial reduction work and traffic to Proton."""
+    n = grid[0] * args["BLOCK_N"]
+    output_values = args["OUTPUT_M"] * n
+    reduced_values = args["REDUCE_M"] * n
+    split_k = args["SPLIT_K"]
+    return {
+        "name": kernel.name,
+        "flops32": reduced_values * (split_k - 1),
+        "bytes": args["REDUCE_M"] * n * split_k * args["partial_ptr"].element_size()
+        + output_values * args["c_ptr"].element_size(),
+    }
+
+
+def _dense16_mediumm_launch_metadata(grid, kernel, args):
+    """Report tiled GEMM work and optional dual-addend traffic."""
+    metadata = _dense16_mm_launch_metadata(grid, kernel, args)
+    if args["ADD3"]:
+        values = args["M"] * args["N"]
+        metadata["flops32"] = 2 * values
+        metadata["bytes"] += values * (
+            args["addend_a_ptr"].element_size() + args["addend_b_ptr"].element_size()
+        )
+    return metadata
+
+
+@gluon.jit
+def _remap_xcd(pid, num_programs, NUM_XCDS: gl.constexpr):
+    # Hardware dispatches program i to XCD i % NUM_XCDS; give each XCD a
+    # contiguous range of program ids instead.
+    pids_per_xcd = (num_programs + NUM_XCDS - 1) // NUM_XCDS
+    tall_xcds = num_programs % NUM_XCDS
+    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
+    xcd = pid % NUM_XCDS
+    local_pid = pid // NUM_XCDS
+    if xcd < tall_xcds:
+        pid = xcd * pids_per_xcd + local_pid
+    else:
+        pid = (
+            tall_xcds * pids_per_xcd
+            + (xcd - tall_xcds) * (pids_per_xcd - 1)
+            + local_pid
+        )
+    return pid
+
+
+@gluon.jit
+def _tile_to_pid(
+    tile_id,
+    num_pid_m,
+    num_pid_n,
+    GROUP_SIZE_M: gl.constexpr,
+):
+    if GROUP_SIZE_M == 1:
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+    else:
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = tile_id // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+        pid_n = (tile_id % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
+
+
+@gluon.constexpr_function
+def _mfma_lds_gload_layout_a(block_m: int, block_k: int, _num_warps: int):
+    if _num_warps == 8 and block_m == 128 and block_k == 64:
+        return gl.DistributedLinearLayout(
+            reg_bases=[[0, 1], [0, 2], [0, 4], [8, 0]],
+            lane_bases=[[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]],
+            warp_bases=[[1, 0], [2, 0], [4, 0]],
+            block_bases=[],
+            shape=[block_m, block_k],
+        )
+    # Each warp writes whole BLOCK_K rows, so its direct-to-LDS copies stay
+    # contiguous in the K-major padded shared layout.
+    if block_m <= 64 or block_k >= 128:
+        if block_k >= 512:
+            return gl.BlockedLayout([1, 8], [1, 64], [4, 1], [1, 0])
+        if block_k >= 256:
+            return gl.BlockedLayout([1, 8], [2, 32], [4, 1], [1, 0])
+        if block_k >= 128:
+            return gl.BlockedLayout([1, 8], [4, 16], [4, 1], [1, 0])
+        return gl.BlockedLayout([1, 8], [8, 8], [4, 1], [1, 0])
+    # 128-wide BLOCK_K=64 tiles.
+    return gl.DistributedLinearLayout(
+        reg_bases=[[0, 1], [0, 2], [0, 4], [4, 0], [8, 0]],
+        lane_bases=[[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]],
+        warp_bases=[[1, 0], [2, 0]],
+        block_bases=[],
+        shape=[block_m, block_k],
+    )
+
+
+@gluon.constexpr_function
+def _mfma_lds_gload_layout_b(block_n: int, block_k: int, _num_warps: int):
+    if _num_warps == 8 and block_n == 128 and block_k == 64:
+        return gl.DistributedLinearLayout(
+            reg_bases=[[1, 0], [2, 0], [4, 0], [0, 8]],
+            lane_bases=[[8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64]],
+            warp_bases=[[0, 1], [0, 2], [0, 4]],
+            block_bases=[],
+            shape=[block_k, block_n],
+        )
+    if block_n <= 64 or block_k >= 128:
+        if block_k >= 512:
+            return gl.BlockedLayout([8, 1], [64, 1], [1, 4], [0, 1])
+        if block_k >= 256:
+            return gl.BlockedLayout([8, 1], [32, 2], [1, 4], [0, 1])
+        if block_k >= 128:
+            return gl.BlockedLayout([8, 1], [16, 4], [1, 4], [0, 1])
+        return gl.BlockedLayout([8, 1], [8, 8], [1, 4], [0, 1])
+    # 128-wide BLOCK_K=64 tiles.
+    return gl.DistributedLinearLayout(
+        reg_bases=[[1, 0], [2, 0], [4, 0], [0, 4], [0, 8]],
+        lane_bases=[[8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64]],
+        warp_bases=[[0, 1], [0, 2]],
+        block_bases=[],
+        shape=[block_k, block_n],
+    )
+
+
+@gluon.constexpr_function
+def _use_coalesced_store(block_m: int, block_n: int, num_warps: int):
+    # Only when every lane owns a distinct 8-wide row segment of the tile;
+    # smaller decode tiles keep the MFMA layout.
+    if block_n < 8:
+        return False
+    lanes_n = min(block_n // 8, 64)
+    return (64 // lanes_n) * num_warps <= block_m
+
+
+@gluon.constexpr_function
+def _coalesced_store_layout(block_m: int, block_n: int, num_warps: int):
+    lanes_n = min(block_n // 8, 64)
+    return gl.BlockedLayout([1, 8], [64 // lanes_n, lanes_n], [num_warps, 1], [1, 0])
+
+
+@gluon.constexpr_function
+def _mfma_lds_manual_shared_offsets_a(block_m: int, block_k: int):
+    bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]]
+    if block_k >= 128:
+        bases += [[0, 64]]
+    if block_k >= 256:
+        bases += [[0, 128]]
+    if block_k >= 512:
+        bases += [[0, 256]]
+    if block_k >= 1024:
+        bases += [[0, 512]]
+    bases += [[1, 0], [2, 0], [4, 0], [8, 0]]
+    if block_m > 16:
+        bases += [[16, 0]]
+    if block_m > 32:
+        bases += [[32, 0]]
+    if block_m > 64:
+        bases += [[64, 0]]
+    return bases
+
+
+@gluon.constexpr_function
+def _mfma_lds_manual_shared_offsets_b(block_n: int, block_k: int):
+    bases = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]]
+    if block_k >= 128:
+        bases += [[64, 0]]
+    if block_k >= 256:
+        bases += [[128, 0]]
+    if block_k >= 512:
+        bases += [[256, 0]]
+    if block_k >= 1024:
+        bases += [[512, 0]]
+    bases += [[0, 1], [0, 2], [0, 4], [0, 8]]
+    if block_n > 16:
+        bases += [[0, 16]]
+    if block_n > 32:
+        bases += [[0, 32]]
+    if block_n > 64:
+        bases += [[0, 64]]
+    return bases
+
+
+@gluon.constexpr_function
+def _mfma_lds_manual_shared_layout_a(block_m: int, block_k: int):
+    return gl.PaddedSharedLayout(
+        [[512, 16]],
+        _mfma_lds_manual_shared_offsets_a(block_m, block_k),
+        [],
+        [block_m, block_k],
+    )
+
+
+@gluon.constexpr_function
+def _mfma_lds_manual_shared_layout_b(block_n: int, block_k: int):
+    return gl.PaddedSharedLayout(
+        [[512, 16]],
+        _mfma_lds_manual_shared_offsets_b(block_n, block_k),
+        [],
+        [block_k, block_n],
+    )
+
+
+@gluon.constexpr_function
+def _mfma_lds_shared_layout_a(dot_layout_a, block_m: int, block_k: int, dtype):
+    if block_m <= 64 or block_k >= 128:
+        return _mfma_lds_manual_shared_layout_a(block_m, block_k)
+    layout = gl.amd.cdna4.compute_efficient_padded_shared_layout(
+        dot_layout_a,
+        [block_m, block_k],
+        dtype,
+        is_k_contig=True,
+    )
+    if layout is not None:
+        return layout
+    return _mfma_lds_manual_shared_layout_a(block_m, block_k)
+
+
+@gluon.constexpr_function
+def _mfma_lds_shared_layout_b(dot_layout_b, block_n: int, block_k: int, dtype):
+    if block_n <= 64 or block_k >= 128:
+        return _mfma_lds_manual_shared_layout_b(block_n, block_k)
+    layout = gl.amd.cdna4.compute_efficient_padded_shared_layout(
+        dot_layout_b,
+        [block_k, block_n],
+        dtype,
+        is_k_contig=True,
+    )
+    if layout is not None:
+        return layout
+    return _mfma_lds_manual_shared_layout_b(block_n, block_k)
+
+
+@gluon.jit(launch_metadata=_dense16_bmm_launch_metadata)
+def gluon_bmm_a16w16_gfx950(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    a_batch_stride,
+    b_batch_stride,
+    b_k_stride,
+    output_batch_stride,
+    K: gl.constexpr,
+    N: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    WAVEFRONT_SIZE: gl.constexpr,
+):
+    pid = gl.program_id(0)
+    num_pid_n: gl.constexpr = N // BLOCK_N
+    batch = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    layout: gl.constexpr = gl.BlockedLayout(
+        [
+            (BLOCK_N + NUM_WARPS - 1) // NUM_WARPS,
+            K // WAVEFRONT_SIZE,
+        ],
+        [1, WAVEFRONT_SIZE],
+        [NUM_WARPS, 1],
+        [1, 0],
+    )
+    n_layout: gl.constexpr = gl.SliceLayout(1, layout)
+    k_layout: gl.constexpr = gl.SliceLayout(0, layout)
+    offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=n_layout)
+    offs_k = gl.arange(0, K, layout=k_layout)
+    a = cdna4.buffer_load(
+        a_ptr,
+        (batch * a_batch_stride + offs_k).to(gl.int32),
+    ).to(gl.float32)
+    b = cdna4.buffer_load(
+        b_ptr,
+        (
+            batch * b_batch_stride
+            + offs_n[:, None].to(gl.int64)
+            + offs_k[None, :].to(gl.int64) * b_k_stride
+        ).to(gl.int32),
+    )
+    a = gl.convert_layout(a[None, :], layout)
+    result = gl.sum(b.to(gl.float32) * a, axis=1)
+    gl.store(
+        output_ptr + batch * output_batch_stride + offs_n,
+        result.to(output_ptr.dtype.element_ty),
+    )
+
+
+@gluon.jit(launch_metadata=_dense16_splitk_launch_metadata)
+def gluon_mm_a16w16_splitk_gfx950(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    partial_ptr,
+    M,
+    N,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    SPLIT_K: gl.constexpr,
+    PARTIAL_M: gl.constexpr,
+    K_TILES_PER_SPLIT: gl.constexpr,
+    NUM_PROGRAMS: gl.constexpr,
+):
+    """Split-K producer for high-K M in {1, 2, 4} dense16 decode GEMM."""
+    pid = gl.program_id(axis=0)
+    num_pid_n = gl.cdiv(N, BLOCK_N)
+    total_work = num_pid_n * SPLIT_K
+
+    gLoadLayoutBbig: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[[0, 1], [0, 2], [0, 4], [4, 0], [8, 0], [128, 0]],
+        lane_bases=[[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]],
+        warp_bases=[[1, 0], [2, 0]],
+        block_bases=[],
+        shape=[BLOCK_N, BLOCK_K],
+    )
+    gLoadLayoutAsmall: gl.constexpr = gl.BlockedLayout(
+        [1, 4],
+        [16, 4],
+        [4, 1],
+        [1, 0],
+    )
+    sharedLayoutBbig: gl.constexpr = gl.PaddedSharedLayout(
+        [[512, 16]],
+        [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [16, 0],
+            [32, 0],
+            [64, 0],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [128, 0],
+        ],
+        [],
+        [BLOCK_N, BLOCK_K],
+    )
+    mfmaLayout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[4, 1],
+    )
+    dotOpLayoutBbig: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfmaLayout, k_width=8
+    )
+    dotOpLayoutAsmall: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfmaLayout, k_width=8
+    )
+    storeLayout: gl.constexpr = mfmaLayout
+
+    nBuffers: gl.constexpr = 2
+    smem_bbig = gl.allocate_shared_memory(
+        b_ptr.dtype.element_ty, [nBuffers, BLOCK_N, BLOCK_K], sharedLayoutBbig
+    )
+
+    offs_bn = gl.arange(0, BLOCK_N, gl.SliceLayout(1, gLoadLayoutBbig))
+    offs_bk_big = gl.arange(0, BLOCK_K, gl.SliceLayout(0, gLoadLayoutBbig))
+    offs_am = gl.arange(0, BLOCK_M, gl.SliceLayout(1, gLoadLayoutAsmall))
+    offs_ak_small = gl.arange(0, BLOCK_K, gl.SliceLayout(0, gLoadLayoutAsmall))
+
+    offs_store_n = gl.arange(0, BLOCK_N, gl.SliceLayout(1, storeLayout))
+    offs_store_m = gl.arange(0, BLOCK_M, gl.SliceLayout(0, storeLayout))
+    partial_offsets = offs_store_m[None, :] * BLOCK_N + offs_store_n[:, None]
+
+    gl.static_assert(K_TILES_PER_SPLIT >= 2, "MFMA LDS GEMM needs at least two K tiles")
+
+    work_id = pid
+    while work_id < total_work:
+        tile_n = work_id // SPLIT_K
+        split_id = work_id - tile_n * SPLIT_K
+        k_split_start = split_id * K_TILES_PER_SPLIT * BLOCK_K
+        n_base = tile_n * BLOCK_N
+        n_load = n_base + offs_bn
+        n_store = n_base + offs_store_n
+
+        bbig_base_offsets = (
+            n_load[:, None] * stride_bn + offs_bk_big[None, :] * stride_bk
+        ).to(gl.int32)
+        asmall_base_offsets = (
+            offs_am[:, None] * stride_am + offs_ak_small[None, :] * stride_ak
+        ).to(gl.int32)
+        asmall_mask = offs_am[:, None] < M
+
+        bbig_offsets_0 = (bbig_base_offsets + k_split_start * stride_bk).to(gl.int32)
+        asmall_offsets_0 = (asmall_base_offsets + k_split_start * stride_ak).to(
+            gl.int32
+        )
+        async_copy.buffer_load_to_shared(smem_bbig.index(0), b_ptr, bbig_offsets_0)
+        async_copy.commit_group()
+
+        bbig_offsets_1 = (bbig_base_offsets + (k_split_start + BLOCK_K) * stride_bk).to(
+            gl.int32
+        )
+        async_copy.buffer_load_to_shared(smem_bbig.index(1), b_ptr, bbig_offsets_1)
+        async_copy.commit_group()
+
+        async_copy.wait_group(1)
+        bbig = smem_bbig.index(0).load(dotOpLayoutBbig)
+        asmall = cdna4.buffer_load(
+            ptr=a_ptr,
+            offsets=asmall_offsets_0,
+            mask=asmall_mask,
+            other=0.0,
+        )
+        asmall = gl.convert_layout(asmall.trans(1, 0), layout=dotOpLayoutAsmall)
+        acc = gl.zeros((BLOCK_N, BLOCK_M), gl.float32, mfmaLayout)
+
+        for kt in gl.static_range(0, K_TILES_PER_SPLIT - 2):
+            acc = cdna4.mfma(bbig, asmall, acc)
+
+            next_tile = kt + 2
+            g_idx = kt % nBuffers
+            l_idx = (kt + 1) % nBuffers
+            prefetch_k_advance = k_split_start + next_tile * BLOCK_K
+            bbig_offsets = (bbig_base_offsets + prefetch_k_advance * stride_bk).to(
+                gl.int32
+            )
+            async_copy.buffer_load_to_shared(
+                smem_bbig.index(g_idx), b_ptr, bbig_offsets
+            )
+            async_copy.commit_group()
+            async_copy.wait_group(1)
+
+            bbig = smem_bbig.index(l_idx).load(dotOpLayoutBbig)
+            load_k_advance = k_split_start + (kt + 1) * BLOCK_K
+            asmall_offsets = (asmall_base_offsets + load_k_advance * stride_ak).to(
+                gl.int32
+            )
+            asmall = cdna4.buffer_load(
+                ptr=a_ptr,
+                offsets=asmall_offsets,
+                mask=asmall_mask,
+                other=0.0,
+            )
+            asmall = gl.convert_layout(asmall.trans(1, 0), layout=dotOpLayoutAsmall)
+
+        acc = cdna4.mfma(bbig, asmall, acc)
+        async_copy.wait_group(0)
+
+        last_idx: gl.constexpr = (K_TILES_PER_SPLIT - 1) % nBuffers
+        bbig = smem_bbig.index(last_idx).load(dotOpLayoutBbig)
+        last_k_advance = k_split_start + (K_TILES_PER_SPLIT - 1) * BLOCK_K
+        asmall_offsets = (asmall_base_offsets + last_k_advance * stride_ak).to(gl.int32)
+        asmall = cdna4.buffer_load(
+            ptr=a_ptr,
+            offsets=asmall_offsets,
+            mask=asmall_mask,
+            other=0.0,
+        )
+        asmall = gl.convert_layout(asmall.trans(1, 0), layout=dotOpLayoutAsmall)
+        acc = cdna4.mfma(bbig, asmall, acc)
+
+        acc_store = gl.convert_layout(acc, layout=storeLayout)
+        c_base = c_ptr + n_base * stride_cn
+        c_offsets = (
+            offs_store_n[:, None] * stride_cn + offs_store_m[None, :] * stride_cm
+        )
+        c_mask = (n_store[:, None] < N) & (offs_store_m[None, :] < M)
+        partial_mask = c_mask & (offs_store_m[None, :] < PARTIAL_M)
+
+        if SPLIT_K == 1:
+            cdna4.buffer_store(
+                ptr=c_base,
+                offsets=c_offsets,
+                stored_value=acc_store.to(c_ptr.dtype.element_ty),
+                mask=c_mask,
+            )
+        else:
+            tile_elems: gl.constexpr = BLOCK_N * PARTIAL_M
+            split_partial_offset = (tile_n * SPLIT_K + split_id) * tile_elems
+            cdna4.buffer_store(
+                ptr=partial_ptr,
+                offsets=(split_partial_offset + partial_offsets).to(gl.int32),
+                stored_value=acc_store,
+                mask=partial_mask,
+            )
+
+        work_id += NUM_PROGRAMS
+
+
+@gluon.jit(launch_metadata=_dense16_splitk_reduce_launch_metadata)
+def gluon_mm_a16w16_splitk_reduce_gfx950(
+    partial_ptr,
+    c_ptr,
+    stride_cm,
+    stride_cn,
+    BLOCK_N: gl.constexpr,
+    REDUCE_M: gl.constexpr,
+    OUTPUT_M: gl.constexpr,
+    SPLIT_K: gl.constexpr,
+):
+    """Partial-sum reducer for small-M split-K dense16 partials."""
+    tile_n = gl.program_id(axis=0)
+    n_base = tile_n * BLOCK_N
+
+    reduceLayout: gl.constexpr = gl.BlockedLayout(
+        [1, 4],
+        [1, 64],
+        [4, 1],
+        [1, 0],
+    )
+    offs_m = gl.arange(0, REDUCE_M, gl.SliceLayout(1, reduceLayout))
+    offs_n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, reduceLayout))
+    partial_offsets = offs_m[:, None] * BLOCK_N + offs_n[None, :]
+    c_offsets = offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+
+    tile_elems: gl.constexpr = BLOCK_N * REDUCE_M
+    tile_partial_offset = tile_n * SPLIT_K * tile_elems
+    reduced = gl.zeros((REDUCE_M, BLOCK_N), gl.float32, reduceLayout)
+    for split in gl.static_range(SPLIT_K):
+        split_offset = tile_partial_offset + split * tile_elems
+        reduced += cdna4.buffer_load(
+            ptr=partial_ptr,
+            offsets=(split_offset + partial_offsets).to(gl.int32),
+        ).to(gl.float32)
+
+    c_base = c_ptr + n_base * stride_cn
+    cdna4.buffer_store(
+        ptr=c_base,
+        offsets=c_offsets,
+        stored_value=reduced.to(c_ptr.dtype.element_ty),
+        mask=offs_m[:, None] < OUTPUT_M,
+    )
+
+
+@gluon.jit(launch_metadata=_dense16_mediumm_launch_metadata)
+def gluon_mm_a16w16_medium_gfx950(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    addend_a_ptr,
+    addend_b_ptr,
+    partial_ptr,
+    counter_ptr,
+    M,
+    N,
+    K: gl.constexpr,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_addend_am,
+    stride_addend_an,
+    stride_addend_bm,
+    stride_addend_bn,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    WARPS_M: gl.constexpr,
+    WARPS_N: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    GROUP_SIZE_M: gl.constexpr,
+    ADD3: gl.constexpr,
+    SPLIT_K: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+    PID_OFFSET: gl.constexpr = 0,
+    GROUPS: gl.constexpr = 1,
+    STRIDE_AG: gl.constexpr = 0,
+    STRIDE_BG: gl.constexpr = 0,
+    STRIDE_CG: gl.constexpr = 0,
+    scale_ptr=None,
+    STRIDE_SM: gl.constexpr = 0,
+    STRIDE_SG: gl.constexpr = 0,
+    QUANT_OUT: gl.constexpr = False,
+):
+    """MFMA/LDS dense16 GEMM for selected M <= 128 decode and middle-M tiles.
+
+    ``GROUPS > 1`` runs that many independent GEMMs in one launch: group g
+    reads A, B and writes C at element offsets g * STRIDE_AG/BG/CG and owns
+    its own split-K partials and counters.
+
+    ``QUANT_OUT`` stores C as group-32 E4M3 codes of the BF16-rounded result
+    (requires BLOCK_N % 32 == 0) and their UE8M0 scales at
+    ``scale_ptr + row * STRIDE_SM + group * STRIDE_SG + column // 32``, rounded
+    like gluon_quantize_fp8_group32_ue8m0_gfx950.
+
+    With ``SPLIT_K > 1`` each output tile is computed by ``SPLIT_K`` programs
+    over disjoint K slices. Each stores its FP32 partial to ``partial_ptr`` and
+    bumps the tile's ``counter_ptr`` entry; the last arriving program sums all
+    partials in split order, writes C, and resets the counter to zero for the
+    next launch.
+
+    ``NUM_XCDS > 1`` places consecutive tiles on the same XCD, so the M tiles
+    that share a weight tile also share that XCD's L2.
+    """
+    pid = gl.program_id(axis=0) - PID_OFFSET
+    num_pid_m = gl.cdiv(M, BLOCK_M)
+    num_pid_n = gl.cdiv(N, BLOCK_N)
+    if GROUPS > 1:
+        group_programs = num_pid_m * num_pid_n * SPLIT_K
+        group = pid // group_programs
+        pid = pid % group_programs
+        a_ptr += group * STRIDE_AG
+        b_ptr += group * STRIDE_BG
+        c_ptr += group * STRIDE_CG
+        if QUANT_OUT:
+            scale_ptr += group * STRIDE_SG
+        partial_ptr += group * group_programs * (BLOCK_M * BLOCK_N)
+        counter_ptr += group * num_pid_m * num_pid_n
+    if NUM_XCDS > 1:
+        pid = _remap_xcd(pid, num_pid_m * num_pid_n * SPLIT_K, NUM_XCDS)
+    if SPLIT_K == 1:
+        tile = pid
+        k_base = 0
+    else:
+        gl.static_assert(not ADD3, "split-K tiled MFMA GEMM does not support ADD3")
+        num_tiles = num_pid_m * num_pid_n
+        tile = pid % num_tiles
+        split = pid // num_tiles
+        k_base = split * (K // SPLIT_K)
+    pid_m, pid_n = _tile_to_pid(tile, num_pid_m, num_pid_n, GROUP_SIZE_M)
+
+    gl.static_assert(
+        BLOCK_M % 16 == 0, "tiled MFMA GEMM requires BLOCK_M multiple of 16"
+    )
+    gl.static_assert(
+        BLOCK_N % 16 == 0, "tiled MFMA GEMM requires BLOCK_N multiple of 16"
+    )
+    gl.static_assert(
+        BLOCK_K == 64
+        or BLOCK_K == 128
+        or BLOCK_K == 256
+        or BLOCK_K == 512
+        or BLOCK_K == 1024,
+        "tiled MFMA GEMM expects BLOCK_K in {64, 128, 256, 512, 1024}",
+    )
+    gl.static_assert(
+        NUM_BUFFERS >= 1 and NUM_BUFFERS <= 8,
+        "tiled MFMA GEMM uses one to eight LDS buffers",
+    )
+
+    NUM_WARPS: gl.constexpr = WARPS_M * WARPS_N
+    gl.static_assert(
+        NUM_WARPS == 4 or NUM_WARPS == 8,
+        "tiled MFMA GEMM currently uses four- or eight-wave load layouts",
+    )
+    if NUM_WARPS == 8:
+        gl.static_assert(
+            BLOCK_M == 128 and BLOCK_N == 128 and BLOCK_K == 64,
+            "eight-wave tiled MFMA GEMM supports only 128x128x64 tiles",
+        )
+    if BLOCK_K == 1024:
+        gl.static_assert(
+            BLOCK_M == 16 and BLOCK_N == 16 and NUM_BUFFERS == 2,
+            "1024-depth tiled MFMA GEMM fits LDS only as 16x16x1024 with two buffers",
+        )
+    gLoadLayoutA: gl.constexpr = _mfma_lds_gload_layout_a(BLOCK_M, BLOCK_K, NUM_WARPS)
+    gLoadLayoutB: gl.constexpr = _mfma_lds_gload_layout_b(BLOCK_N, BLOCK_K, NUM_WARPS)
+
+    mfmaLayout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[WARPS_M, WARPS_N],
+    )
+    dotOpLayoutA: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfmaLayout, k_width=8
+    )
+    dotOpLayoutB: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfmaLayout, k_width=8
+    )
+    sharedLayoutA: gl.constexpr = _mfma_lds_shared_layout_a(
+        dotOpLayoutA, BLOCK_M, BLOCK_K, a_ptr.dtype.element_ty
+    )
+    sharedLayoutB: gl.constexpr = _mfma_lds_shared_layout_b(
+        dotOpLayoutB, BLOCK_N, BLOCK_K, b_ptr.dtype.element_ty
+    )
+
+    smemA = gl.allocate_shared_memory(
+        a_ptr.dtype.element_ty, [NUM_BUFFERS, BLOCK_M, BLOCK_K], sharedLayoutA
+    )
+    smemB = gl.allocate_shared_memory(
+        b_ptr.dtype.element_ty, [NUM_BUFFERS, BLOCK_K, BLOCK_N], sharedLayoutB
+    )
+
+    offs_am = gl.arange(0, BLOCK_M, gl.SliceLayout(1, gLoadLayoutA))
+    offs_ak = gl.arange(0, BLOCK_K, gl.SliceLayout(0, gLoadLayoutA))
+    offs_bn = gl.arange(0, BLOCK_N, gl.SliceLayout(0, gLoadLayoutB))
+    offs_bk = gl.arange(0, BLOCK_K, gl.SliceLayout(1, gLoadLayoutB))
+
+    a_tile_base = pid_m * BLOCK_M * stride_am + k_base * stride_ak
+    # Clamp weight rows past N to the last row instead of masking every B
+    # load; the store mask drops those output columns.
+    b_rows = gl.minimum(pid_n * BLOCK_N + offs_bn, N - 1)
+
+    a_offs0 = (
+        a_tile_base + offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak
+    ).to(gl.int32)
+    a_offs1 = (a_offs0 + BLOCK_K * stride_ak).to(gl.int32)
+    a_offs2 = (a_offs0 + 2 * BLOCK_K * stride_ak).to(gl.int32)
+    b_offs0 = (
+        k_base * stride_bk + offs_bk[:, None] * stride_bk + b_rows[None, :] * stride_bn
+    ).to(gl.int32)
+    b_offs1 = (b_offs0 + BLOCK_K * stride_bk).to(gl.int32)
+    b_offs2 = (b_offs0 + 2 * BLOCK_K * stride_bk).to(gl.int32)
+    a_kstep = NUM_BUFFERS * BLOCK_K * stride_ak
+    b_kstep = NUM_BUFFERS * BLOCK_K * stride_bk
+
+    m = pid_m * BLOCK_M + offs_am
+    a_mask = m[:, None] < M
+
+    gl.static_assert(
+        K % (SPLIT_K * BLOCK_K) == 0,
+        "tiled MFMA GEMM needs K divisible by SPLIT_K * BLOCK_K",
+    )
+    k_tiles: gl.constexpr = K // (SPLIT_K * BLOCK_K)
+    if NUM_BUFFERS == 1:
+        gl.static_assert(
+            k_tiles == 1, "one-buffer tiled MFMA GEMM supports exactly one K tile"
+        )
+    elif NUM_BUFFERS == 2:
+        gl.static_assert(
+            k_tiles >= 2, "two-buffer tiled MFMA GEMM needs at least two K tiles"
+        )
+    elif NUM_BUFFERS == 3:
+        gl.static_assert(
+            k_tiles >= 3, "three-buffer tiled MFMA GEMM needs at least three K tiles"
+        )
+    else:
+        gl.static_assert(
+            k_tiles == NUM_BUFFERS,
+            "more than three LDS buffers hold every K tile of the program",
+        )
+
+    acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfmaLayout)
+
+    if NUM_BUFFERS == 1:
+        async_copy.buffer_load_to_shared(smemA.index(0), a_ptr, a_offs0, mask=a_mask)
+        async_copy.commit_group()
+        async_copy.buffer_load_to_shared(smemB.index(0), b_ptr, b_offs0)
+        async_copy.commit_group()
+        async_copy.wait_group(0)
+        a = async_copy.load_shared_relaxed(smemA.index(0), dotOpLayoutA)
+        b = async_copy.load_shared_relaxed(smemB.index(0), dotOpLayoutB)
+        acc = cdna4.mfma(a, b, acc)
+
+    elif NUM_BUFFERS > 3:
+        # Short reductions: issue every K tile at once so the program waits on
+        # one memory round trip instead of one per refilled buffer.
+        for t in gl.static_range(NUM_BUFFERS):
+            async_copy.buffer_load_to_shared(
+                smemA.index(t),
+                a_ptr,
+                (a_offs0 + t * BLOCK_K * stride_ak).to(gl.int32),
+                mask=a_mask,
+            )
+            async_copy.buffer_load_to_shared(
+                smemB.index(t), b_ptr, (b_offs0 + t * BLOCK_K * stride_bk).to(gl.int32)
+            )
+            async_copy.commit_group()
+        for t in gl.static_range(NUM_BUFFERS):
+            async_copy.wait_group(NUM_BUFFERS - 1 - t)
+            a = async_copy.load_shared_relaxed(smemA.index(t), dotOpLayoutA)
+            b = async_copy.load_shared_relaxed(smemB.index(t), dotOpLayoutB)
+            acc = cdna4.mfma(a, b, acc)
+
+    elif NUM_BUFFERS == 2:
+        async_copy.buffer_load_to_shared(smemA.index(0), a_ptr, a_offs0, mask=a_mask)
+        async_copy.commit_group()
+        async_copy.buffer_load_to_shared(smemB.index(0), b_ptr, b_offs0)
+        async_copy.commit_group()
+        async_copy.buffer_load_to_shared(smemA.index(1), a_ptr, a_offs1, mask=a_mask)
+        async_copy.commit_group()
+        async_copy.buffer_load_to_shared(smemB.index(1), b_ptr, b_offs1)
+        async_copy.commit_group()
+        a_offs0 = (a_offs0 + a_kstep).to(gl.int32)
+        a_offs1 = (a_offs1 + a_kstep).to(gl.int32)
+        b_offs0 = (b_offs0 + b_kstep).to(gl.int32)
+        b_offs1 = (b_offs1 + b_kstep).to(gl.int32)
+
+        async_copy.wait_group(2)
+        a = async_copy.load_shared_relaxed(smemA.index(0), dotOpLayoutA)
+        b = async_copy.load_shared_relaxed(smemB.index(0), dotOpLayoutB)
+
+        main_loop_pairs: gl.constexpr = (k_tiles - NUM_BUFFERS) // NUM_BUFFERS
+        for _ in tl.range(0, main_loop_pairs):
+            with gl.amd.warp_pipeline_stage("mfma", priority=0):
+                acc = cdna4.mfma(a, b, acc)
+            with gl.amd.warp_pipeline_stage("mem", priority=1):
+                async_copy.wait_group(0)
+                a = async_copy.load_shared_relaxed(smemA.index(1), dotOpLayoutA)
+                b = async_copy.load_shared_relaxed(smemB.index(1), dotOpLayoutB)
+                async_copy.buffer_load_to_shared(
+                    smemA.index(0), a_ptr, a_offs0, mask=a_mask
+                )
+                async_copy.commit_group()
+                async_copy.buffer_load_to_shared(smemB.index(0), b_ptr, b_offs0)
+                async_copy.commit_group()
+
+            with gl.amd.warp_pipeline_stage("mfma", priority=0):
+                acc = cdna4.mfma(a, b, acc)
+            with gl.amd.warp_pipeline_stage("mem", priority=1):
+                async_copy.wait_group(0)
+                a = async_copy.load_shared_relaxed(smemA.index(0), dotOpLayoutA)
+                b = async_copy.load_shared_relaxed(smemB.index(0), dotOpLayoutB)
+                async_copy.buffer_load_to_shared(
+                    smemA.index(1), a_ptr, a_offs1, mask=a_mask
+                )
+                async_copy.commit_group()
+                async_copy.buffer_load_to_shared(smemB.index(1), b_ptr, b_offs1)
+                async_copy.commit_group()
+                a_offs0 = (a_offs0 + a_kstep).to(gl.int32)
+                a_offs1 = (a_offs1 + a_kstep).to(gl.int32)
+                b_offs0 = (b_offs0 + b_kstep).to(gl.int32)
+                b_offs1 = (b_offs1 + b_kstep).to(gl.int32)
+
+        tiles_processed: gl.constexpr = main_loop_pairs * NUM_BUFFERS
+        tiles_remaining: gl.constexpr = k_tiles - tiles_processed
+
+        acc = cdna4.mfma(a, b, acc)
+        async_copy.wait_group(0)
+
+        a = async_copy.load_shared_relaxed(smemA.index(1), dotOpLayoutA)
+        b = async_copy.load_shared_relaxed(smemB.index(1), dotOpLayoutB)
+        acc = cdna4.mfma(a, b, acc)
+
+        if tiles_remaining > 2:
+            async_copy.buffer_load_to_shared(
+                smemA.index(0), a_ptr, a_offs0, mask=a_mask
+            )
+            async_copy.commit_group()
+            async_copy.buffer_load_to_shared(smemB.index(0), b_ptr, b_offs0)
+            async_copy.commit_group()
+            async_copy.wait_group(0)
+            a = async_copy.load_shared_relaxed(smemA.index(0), dotOpLayoutA)
+            b = async_copy.load_shared_relaxed(smemB.index(0), dotOpLayoutB)
+            acc = cdna4.mfma(a, b, acc)
+
+    else:
+        async_copy.buffer_load_to_shared(smemA.index(0), a_ptr, a_offs0, mask=a_mask)
+        async_copy.commit_group()
+        async_copy.buffer_load_to_shared(smemB.index(0), b_ptr, b_offs0)
+        async_copy.commit_group()
+        async_copy.buffer_load_to_shared(smemA.index(1), a_ptr, a_offs1, mask=a_mask)
+        async_copy.commit_group()
+        async_copy.buffer_load_to_shared(smemB.index(1), b_ptr, b_offs1)
+        async_copy.commit_group()
+        async_copy.buffer_load_to_shared(smemA.index(2), a_ptr, a_offs2, mask=a_mask)
+        async_copy.commit_group()
+        async_copy.buffer_load_to_shared(smemB.index(2), b_ptr, b_offs2)
+        async_copy.commit_group()
+        a_offs0 = (a_offs0 + a_kstep).to(gl.int32)
+        a_offs1 = (a_offs1 + a_kstep).to(gl.int32)
+        a_offs2 = (a_offs2 + a_kstep).to(gl.int32)
+        b_offs0 = (b_offs0 + b_kstep).to(gl.int32)
+        b_offs1 = (b_offs1 + b_kstep).to(gl.int32)
+        b_offs2 = (b_offs2 + b_kstep).to(gl.int32)
+
+        async_copy.wait_group(4)
+        a = async_copy.load_shared_relaxed(smemA.index(0), dotOpLayoutA)
+        b = async_copy.load_shared_relaxed(smemB.index(0), dotOpLayoutB)
+
+        main_loop_triples: gl.constexpr = (k_tiles - NUM_BUFFERS) // NUM_BUFFERS
+        for _ in tl.range(0, main_loop_triples):
+            async_copy.wait_group(2)
+            with gl.amd.warp_pipeline_stage("mfma", priority=0):
+                acc = cdna4.mfma(a, b, acc)
+            with gl.amd.warp_pipeline_stage("mem", priority=1):
+                a = async_copy.load_shared_relaxed(smemA.index(1), dotOpLayoutA)
+                b = async_copy.load_shared_relaxed(smemB.index(1), dotOpLayoutB)
+                async_copy.buffer_load_to_shared(
+                    smemA.index(0), a_ptr, a_offs0, mask=a_mask
+                )
+                async_copy.commit_group()
+                async_copy.buffer_load_to_shared(smemB.index(0), b_ptr, b_offs0)
+                async_copy.commit_group()
+
+            async_copy.wait_group(2)
+            with gl.amd.warp_pipeline_stage("mfma", priority=0):
+                acc = cdna4.mfma(a, b, acc)
+            with gl.amd.warp_pipeline_stage("mem", priority=1):
+                a = async_copy.load_shared_relaxed(smemA.index(2), dotOpLayoutA)
+                b = async_copy.load_shared_relaxed(smemB.index(2), dotOpLayoutB)
+                async_copy.buffer_load_to_shared(
+                    smemA.index(1), a_ptr, a_offs1, mask=a_mask
+                )
+                async_copy.commit_group()
+                async_copy.buffer_load_to_shared(smemB.index(1), b_ptr, b_offs1)
+                async_copy.commit_group()
+
+            async_copy.wait_group(2)
+            with gl.amd.warp_pipeline_stage("mfma", priority=0):
+                acc = cdna4.mfma(a, b, acc)
+            with gl.amd.warp_pipeline_stage("mem", priority=1):
+                a = async_copy.load_shared_relaxed(smemA.index(0), dotOpLayoutA)
+                b = async_copy.load_shared_relaxed(smemB.index(0), dotOpLayoutB)
+                async_copy.buffer_load_to_shared(
+                    smemA.index(2), a_ptr, a_offs2, mask=a_mask
+                )
+                async_copy.commit_group()
+                async_copy.buffer_load_to_shared(smemB.index(2), b_ptr, b_offs2)
+                async_copy.commit_group()
+                a_offs0 = (a_offs0 + a_kstep).to(gl.int32)
+                a_offs1 = (a_offs1 + a_kstep).to(gl.int32)
+                a_offs2 = (a_offs2 + a_kstep).to(gl.int32)
+                b_offs0 = (b_offs0 + b_kstep).to(gl.int32)
+                b_offs1 = (b_offs1 + b_kstep).to(gl.int32)
+                b_offs2 = (b_offs2 + b_kstep).to(gl.int32)
+
+        tiles_processed: gl.constexpr = main_loop_triples * NUM_BUFFERS
+        tiles_remaining: gl.constexpr = k_tiles - tiles_processed
+
+        acc = cdna4.mfma(a, b, acc)
+        async_copy.wait_group(0)
+
+        a = async_copy.load_shared_relaxed(smemA.index(1), dotOpLayoutA)
+        b = async_copy.load_shared_relaxed(smemB.index(1), dotOpLayoutB)
+        acc = cdna4.mfma(a, b, acc)
+
+        a = async_copy.load_shared_relaxed(smemA.index(2), dotOpLayoutA)
+        b = async_copy.load_shared_relaxed(smemB.index(2), dotOpLayoutB)
+        acc = cdna4.mfma(a, b, acc)
+
+        if tiles_remaining > 3:
+            async_copy.buffer_load_to_shared(
+                smemA.index(0), a_ptr, a_offs0, mask=a_mask
+            )
+            async_copy.commit_group()
+            async_copy.buffer_load_to_shared(smemB.index(0), b_ptr, b_offs0)
+            async_copy.commit_group()
+            async_copy.wait_group(0)
+            a = async_copy.load_shared_relaxed(smemA.index(0), dotOpLayoutA)
+            b = async_copy.load_shared_relaxed(smemB.index(0), dotOpLayoutB)
+            acc = cdna4.mfma(a, b, acc)
+
+        if tiles_remaining > 4:
+            async_copy.buffer_load_to_shared(
+                smemA.index(1), a_ptr, a_offs1, mask=a_mask
+            )
+            async_copy.commit_group()
+            async_copy.buffer_load_to_shared(smemB.index(1), b_ptr, b_offs1)
+            async_copy.commit_group()
+            async_copy.wait_group(0)
+            a = async_copy.load_shared_relaxed(smemA.index(1), dotOpLayoutA)
+            b = async_copy.load_shared_relaxed(smemB.index(1), dotOpLayoutB)
+            acc = cdna4.mfma(a, b, acc)
+
+    acc_store = gl.convert_layout(acc, layout=mfmaLayout)
+    offs_cm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, mfmaLayout))
+    offs_cn = gl.arange(0, BLOCK_N, gl.SliceLayout(0, mfmaLayout))
+    cm = pid_m * BLOCK_M + offs_cm
+    cn = pid_n * BLOCK_N + offs_cn
+    c_offsets = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+    c_mask = (cm[:, None] < M) & (cn[None, :] < N)
+    if SPLIT_K > 1:
+        tile_elems: gl.constexpr = BLOCK_M * BLOCK_N
+        partial_offsets = offs_cm[:, None] * BLOCK_N + offs_cn[None, :]
+        num_tiles_sk = num_pid_m * num_pid_n
+        cdna4.buffer_store(
+            ptr=partial_ptr + (split * num_tiles_sk + tile) * tile_elems,
+            offsets=partial_offsets,
+            stored_value=acc_store,
+            cache=".wt",
+        )
+        # Publish the partial without an acq_rel atomic, whose L2 writeback and
+        # invalidate cost more than the GEMM: ".wt" writes through to memory,
+        # every wave waits for its stores to complete (vmcnt), and the barrier
+        # orders all waves' stores before the counter bump.
+        gl.inline_asm_elementwise(
+            asm="s_waitcnt vmcnt(0)",
+            constraints="=v,0",
+            args=[offs_cm],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
+        gl.barrier()
+        old = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")
+        if old != SPLIT_K - 1:
+            return
+        # Sum in split order, not arrival order, so results are deterministic.
+        # ".cv" bypasses caches so partials from other XCDs are not stale.
+        acc_store = cdna4.buffer_load(
+            ptr=partial_ptr + tile * tile_elems,
+            offsets=partial_offsets,
+            cache=".cv",
+        )
+        for s in gl.static_range(1, SPLIT_K):
+            acc_store += cdna4.buffer_load(
+                ptr=partial_ptr + (s * num_tiles_sk + tile) * tile_elems,
+                offsets=partial_offsets,
+                cache=".cv",
+            )
+        gl.store(counter_ptr + tile, 0)
+    if ADD3:
+        addend_a_offsets = (
+            offs_cm[:, None] * stride_addend_am + offs_cn[None, :] * stride_addend_an
+        )
+        addend_b_offsets = (
+            offs_cm[:, None] * stride_addend_bm + offs_cn[None, :] * stride_addend_bn
+        )
+        addend_a_base = (
+            addend_a_ptr
+            + pid_m * BLOCK_M * stride_addend_am
+            + pid_n * BLOCK_N * stride_addend_an
+        )
+        addend_b_base = (
+            addend_b_ptr
+            + pid_m * BLOCK_M * stride_addend_bm
+            + pid_n * BLOCK_N * stride_addend_bn
+        )
+        acc_store += cdna4.buffer_load(
+            ptr=addend_a_base,
+            offsets=addend_a_offsets,
+            mask=c_mask,
+            other=0.0,
+        )
+        acc_store += cdna4.buffer_load(
+            ptr=addend_b_base,
+            offsets=addend_b_offsets,
+            mask=c_mask,
+            other=0.0,
+        )
+    if QUANT_OUT:
+        gl.static_assert(BLOCK_N % 32 == 0, "quantized output needs BLOCK_N % 32")
+        quant_layout: gl.constexpr = _coalesced_store_layout(
+            BLOCK_M, BLOCK_N, NUM_WARPS
+        )
+        values = gl.convert_layout(
+            acc_store.to(gl.bfloat16).to(gl.float32), layout=quant_layout
+        )
+        groups = gl.reshape(values, [BLOCK_M, BLOCK_N // 32, 32])
+        amax = gl.maximum(gl.max(gl.abs(groups), 2), 1.0e-4)
+        bits = (amax * (1.0 / 448.0)).to(gl.int32, bitcast=True)
+        exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(gl.int32)
+        inverse = 1.0 / (exponent << 23).to(gl.float32, bitcast=True)
+        codes = gl.reshape(
+            (groups * gl.expand_dims(inverse, 2)).to(gl.float8e4nv),
+            [BLOCK_M, BLOCK_N],
+        )
+        codes = gl.convert_layout(codes, layout=quant_layout)
+        qm = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, gl.SliceLayout(1, quant_layout))
+        qn = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, gl.SliceLayout(0, quant_layout))
+        gl.store(
+            c_ptr + qm[:, None] * stride_cm + qn[None, :] * stride_cn,
+            codes,
+            mask=(qm[:, None] < M) & (qn[None, :] < N),
+        )
+        scale_layout: gl.constexpr = gl.SliceLayout(2, groups.type.layout)
+        sm = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, gl.SliceLayout(1, scale_layout))
+        sg = pid_n * (BLOCK_N // 32) + gl.arange(
+            0, BLOCK_N // 32, gl.SliceLayout(0, scale_layout)
+        )
+        gl.store(
+            scale_ptr + sm[:, None] * STRIDE_SM + sg[None, :],
+            exponent.to(gl.uint8),
+            mask=(sm[:, None] < M) & (sg[None, :] < N // 32),
+        )
+        return
+    c_base = c_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
+    if _use_coalesced_store(BLOCK_M, BLOCK_N, NUM_WARPS):
+        # Rows of 8 contiguous outputs per lane store 16 bytes at a time; the
+        # MFMA layout would scatter 4-element column pieces instead.
+        storeLayout: gl.constexpr = _coalesced_store_layout(BLOCK_M, BLOCK_N, NUM_WARPS)
+        offs_sm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, storeLayout))
+        offs_sn = gl.arange(0, BLOCK_N, gl.SliceLayout(0, storeLayout))
+        sm = pid_m * BLOCK_M + offs_sm
+        sn = pid_n * BLOCK_N + offs_sn
+        cdna4.buffer_store(
+            ptr=c_base,
+            offsets=offs_sm[:, None] * stride_cm + offs_sn[None, :] * stride_cn,
+            stored_value=gl.convert_layout(
+                acc_store.to(c_ptr.dtype.element_ty), layout=storeLayout
+            ),
+            mask=(sm[:, None] < M) & (sn[None, :] < N),
+        )
+    else:
+        cdna4.buffer_store(
+            ptr=c_base,
+            offsets=c_offsets,
+            stored_value=acc_store.to(c_ptr.dtype.element_ty),
+            mask=c_mask,
+        )
+
+
+def _allocate_partial_scratch(
+    device: torch.device,
+    total_tiles: int,
+    split_k: int,
+    block_n: int,
+    block_m: int = DENSE16_BLOCK_M,
+) -> torch.Tensor:
+    return torch.empty(
+        (total_tiles * split_k * block_m * block_n,),
+        device=device,
+        dtype=torch.float32,
+    )
+
+
+def _get_partial_scratch(
+    device: torch.device,
+    total_tiles: int,
+    split_k: int,
+    block_n: int,
+    block_m: int = DENSE16_BLOCK_M,
+) -> torch.Tensor:
+    """Return stream-local split-K partial sums.
+
+    Same-stream calls are ordered, so they can safely reuse scratch. Different
+    streams must not share the buffer because the producer and reducer kernels run
+    asynchronously and can otherwise overwrite another invocation's partial sums.
+    During CUDA/HIP graph capture, allocate from PyTorch's graph-aware allocator
+    without storing graph-private memory in the eager cache.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return _allocate_partial_scratch(device, total_tiles, split_k, block_n, block_m)
+
+    device_index = torch.cuda.current_device() if device.index is None else device.index
+    stream_id = torch.cuda.current_stream(device_index).cuda_stream
+    key = (device_index, stream_id, total_tiles, split_k, block_m * block_n)
+    cached = _partial_cache.get(key)
+    if cached is not None:
+        return cached
+
+    partial = _allocate_partial_scratch(device, total_tiles, split_k, block_n, block_m)
+    _partial_cache[key] = partial
+    return partial
+
+
+def _check_supported_dense16_shape(M: int, N: int, K: int) -> None:
+    if M <= 0 or N <= 0 or K <= 0:
+        raise ValueError(
+            f"dense16 Gluon GEMM requires positive M/N/K, got M={M}, N={N}, K={K}"
+        )
+    if M > MAX_M:
+        raise ValueError(f"dense16 Gluon GEMM requires M <= {MAX_M}; got M={M}")
+    if N % DENSE16_BLOCK_N != 0:
+        raise ValueError(
+            f"dense16 Gluon GEMM requires N to be a multiple of {DENSE16_BLOCK_N}; "
+            f"got N={N}"
+        )
+    if K % DENSE16_BLOCK_K != 0:
+        raise ValueError(
+            f"dense16 Gluon GEMM requires K to be a multiple of {DENSE16_BLOCK_K}; "
+            f"got K={K}"
+        )
+
+
+def _resolve_output(
+    A: torch.Tensor,
+    shape: tuple[int, ...],
+    out_dtype: torch.dtype,
+    out: torch.Tensor | None,
+    op_name: str,
+) -> torch.Tensor:
+    if out is None:
+        return torch.empty(shape, device=A.device, dtype=out_dtype)
+    if out.shape != shape:
+        raise ValueError(f"{op_name} output must have shape {shape}, got {out.shape}")
+    if out.dtype != out_dtype:
+        raise TypeError(f"{op_name} output dtype must be {out_dtype}, got {out.dtype}")
+    if out.device != A.device:
+        raise ValueError(f"{op_name} output must be on {A.device}, got {out.device}")
+    if out.stride(-1) != 1:
+        raise ValueError(f"{op_name} output must be contiguous in the last dimension")
+    return out
+
+
+def _choose_mfma_lds_split_k(K: int) -> int:
+    k_tiles = K // MFMA_LDS_BLOCK_K
+    for split_k in (MFMA_LDS_SPLIT_K, 7, 6, 5, 4, 3, 2):
+        if k_tiles % split_k == 0 and k_tiles // split_k >= 2:
+            return split_k
+    return 0
+
+
+def _supports_mfma_lds_smallm(M: int, N: int, K: int) -> bool:
+    return (
+        M in (1, 2, MFMA_LDS_REDUCE_M)
+        and K >= MFMA_LDS_BLOCK_K * 2 * MFMA_LDS_SPLIT_K
+        and N % MFMA_LDS_BLOCK_N == 0
+        and K % MFMA_LDS_BLOCK_K == 0
+        and _choose_mfma_lds_split_k(K) > 1
+    )
+
+
+def _choose_mfma_lds_mediumm_config(
+    M: int, N: int, K: int
+) -> tuple[int, int, int, int, int, int] | None:
+    if M < 8 or K % DENSE16_BLOCK_K != 0 or N % DENSE16_BLOCK_N != 0:
+        return None
+    if (K, N) == (7168, 3584) and 768 <= M <= 1024 and M % 128 == 0:
+        return 128, 128, DENSE16_BLOCK_K, 2, 4, 3
+    if (K, N) == (3584, 7168) and 384 <= M <= 512 and M % 64 == 0:
+        return 128, 128, DENSE16_BLOCK_K, 2, 4, 3
+    if M <= 32:
+        block_m = 16 if M <= 16 else 32
+        if K == DENSE16_BLOCK_K:
+            return block_m, 32, DENSE16_BLOCK_K, 2, 2, 1
+        if K < 1024:
+            if K % 256 == 0 and K // 256 >= 2:
+                num_buffers = 2 if K // 256 == 2 else 3
+                return block_m, 32, 256, 2, 2, num_buffers
+            if K % 128 == 0 and K // 128 >= 2:
+                num_buffers = 2 if K // 128 == 2 else 3
+                return block_m, 32, 128, 2, 2, num_buffers
+            num_buffers = 2 if K // DENSE16_BLOCK_K == 2 else 3
+            return block_m, 32, DENSE16_BLOCK_K, 2, 2, num_buffers
+        if block_m == 16:
+            if K == 1024:
+                return block_m, 32, 512, 2, 2, 2
+            return None
+        if K == 2048:
+            return 16, 16, 512, 2, 2, 2
+        return None
+    if M <= 128:
+        if K == 1024:
+            return 32, 32, 512, 2, 2, 2
+        if K == 2048:
+            if M <= 64:
+                if N == 1280:
+                    return 32, 32, 512, 2, 2, 2
+                if N == 2560:
+                    return 32, 32, 128, 2, 2, 3
+                return None
+            return 32, 32, DENSE16_BLOCK_K, 2, 2, 3
+        if 2048 < K < 4096 and K % 128 != 0:
+            return 32, 32, DENSE16_BLOCK_K, 2, 2, 3
+        if M == 128 and N == 4096 and K == 4096:
+            return 16, 128, DENSE16_BLOCK_K, 1, 4, 3
+    return None
+
+
+def launch_gluon_bmm_a16w16_gfx950(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Compute the Kimi decode-head ``A @ B.T`` BMM shape."""
+    if A.ndim != 3 or B.ndim != 3:
+        return None
+    if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
+        return None
+    if out_dtype != torch.bfloat16 or alpha is not None:
+        return None
+    if not A.is_cuda or not B.is_cuda or A.device != B.device:
+        return None
+
+    batch, M, K = A.shape
+    batch_b, N, K_b = B.shape
+    if (
+        batch not in (12, 16)
+        or batch_b != batch
+        or M != 1
+        or N != 512
+        or K != 128
+        or K_b != K
+    ):
+        return None
+    if A.stride(-1) != 1 or B.stride(1) != 1:
+        return None
+
+    C = _resolve_output(
+        A,
+        (batch, M, N),
+        out_dtype,
+        out,
+        "small-M dense16 warp-reduce BMM",
+    )
+    gluon_bmm_a16w16_gfx950[(batch * N // BMM_M1_BLOCK_N,)](
+        A,
+        B,
+        C,
+        A.stride(0),
+        B.stride(0),
+        B.stride(2),
+        C.stride(0),
+        K=K,
+        N=N,
+        BLOCK_N=BMM_M1_BLOCK_N,
+        NUM_WARPS=BMM_M1_NUM_WARPS,
+        WAVEFRONT_SIZE=CDNA_WAVEFRONT_SIZE,
+        num_warps=BMM_M1_NUM_WARPS,
+        num_stages=1,
+        waves_per_eu=0,
+    )
+    return C
+
+
+def launch_gluon_mm_a16w16_splitk_gfx950(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute high-K small-M dense ``A @ B.T`` with MFMA and partial-sum reduction.
+
+    Intended for ``M`` in ``{1, 2, 4}``, large ``K``, and ``N`` aligned to the
+    split-K MFMA/LDS tile.
+
+    This decode path maps the wide N dimension onto the MFMA rows, streams the
+    ``[N, K]`` weight tile through double-buffered LDS async copies, splits K
+    into eight partial tiles, and sums those partial results in a second Gluon kernel.
+    """
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError(
+            f"small-M dense16 MFMA LDS GEMM expects 2D inputs, got {A.ndim=} {B.ndim=}"
+        )
+    if A.dtype not in _SUPPORTED_DTYPES or B.dtype not in _SUPPORTED_DTYPES:
+        raise TypeError(
+            "small-M dense16 MFMA LDS GEMM expects fp16/bf16 inputs, got "
+            f"{A.dtype=} {B.dtype=}"
+        )
+    if A.dtype != B.dtype:
+        raise TypeError(
+            "small-M dense16 MFMA LDS GEMM expects matching input dtypes, got "
+            f"{A.dtype=} {B.dtype=}"
+        )
+    if out_dtype not in _SUPPORTED_DTYPES:
+        raise TypeError(
+            f"small-M dense16 MFMA LDS GEMM expects fp16/bf16 output, got {out_dtype=}"
+        )
+    if not A.is_cuda or not B.is_cuda:
+        raise ValueError("small-M dense16 MFMA LDS GEMM requires CUDA/HIP tensors")
+
+    M, K = A.shape
+    N, K_b = B.shape
+    if K_b != K:
+        raise ValueError(
+            "small-M dense16 MFMA LDS GEMM K mismatch: "
+            f"A={tuple(A.shape)} B={tuple(B.shape)}"
+        )
+    _check_supported_dense16_shape(M, N, K)
+    if not _supports_mfma_lds_smallm(M, N, K):
+        raise ValueError(
+            "small-M dense16 MFMA LDS GEMM requires M in {1, 2, 4}, "
+            f"N divisible by {MFMA_LDS_BLOCK_N}, K >= "
+            f"{MFMA_LDS_BLOCK_K * 2 * MFMA_LDS_SPLIT_K}, K divisible by "
+            f"{MFMA_LDS_BLOCK_K}, and K evenly splittable by 2..8 CTAs; "
+            f"got M={M}, N={N}, K={K}"
+        )
+
+    C = _resolve_output(A, (M, N), out_dtype, out, "small-M dense16 MFMA LDS GEMM")
+    split_k = _choose_mfma_lds_split_k(K)
+    num_n_tiles = triton.cdiv(N, MFMA_LDS_BLOCK_N)
+    total_work = num_n_tiles * split_k
+    sms = torch.cuda.get_device_properties(A.device).multi_processor_count
+    grid = min(total_work, sms)
+    partial = _get_partial_scratch(
+        A.device, num_n_tiles, split_k, MFMA_LDS_BLOCK_N, MFMA_LDS_REDUCE_M
+    )
+    k_tiles_per_split = (K // MFMA_LDS_BLOCK_K) // split_k
+
+    gluon_mm_a16w16_splitk_gfx950[(grid,)](
+        A,
+        B,
+        C,
+        partial,
+        M,
+        N,
+        A.stride(0),
+        A.stride(1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(0),
+        C.stride(1),
+        BLOCK_M=DENSE16_BLOCK_M,
+        BLOCK_N=MFMA_LDS_BLOCK_N,
+        BLOCK_K=MFMA_LDS_BLOCK_K,
+        SPLIT_K=split_k,
+        PARTIAL_M=MFMA_LDS_REDUCE_M,
+        K_TILES_PER_SPLIT=k_tiles_per_split,
+        NUM_PROGRAMS=grid,
+        num_warps=MFMA_LDS_NUM_WARPS,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+    gluon_mm_a16w16_splitk_reduce_gfx950[(num_n_tiles,)](
+        partial,
+        C,
+        C.stride(0),
+        C.stride(1),
+        BLOCK_N=MFMA_LDS_BLOCK_N,
+        REDUCE_M=MFMA_LDS_REDUCE_M,
+        OUTPUT_M=M,
+        SPLIT_K=split_k,
+        num_warps=MFMA_LDS_NUM_WARPS,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+
+    if alpha is not None:
+        C.mul_(alpha.to(device=C.device, dtype=C.dtype))
+    return C
+
+
+def launch_gluon_mm_a16w16_medium_gfx950(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute tuned medium-M dense ``A @ B.T`` with MFMA/LDS tiling.
+
+    Intended for selected dense16 decode/prefill tiles where the Gluon route is
+    competitive with torch.mm, including K3's middle-M latent projections.
+    """
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError(
+            f"medium-M dense16 MFMA LDS GEMM expects 2D inputs, got {A.ndim=} {B.ndim=}"
+        )
+    if A.dtype not in _SUPPORTED_DTYPES or B.dtype not in _SUPPORTED_DTYPES:
+        raise TypeError(
+            "medium-M dense16 MFMA LDS GEMM expects fp16/bf16 inputs, got "
+            f"{A.dtype=} {B.dtype=}"
+        )
+    if A.dtype != B.dtype:
+        raise TypeError(
+            "medium-M dense16 MFMA LDS GEMM expects matching input dtypes, got "
+            f"{A.dtype=} {B.dtype=}"
+        )
+    if out_dtype not in _SUPPORTED_DTYPES:
+        raise TypeError(
+            f"medium-M dense16 MFMA LDS GEMM expects fp16/bf16 output, got {out_dtype=}"
+        )
+    if not A.is_cuda or not B.is_cuda:
+        raise ValueError("medium-M dense16 MFMA LDS GEMM requires CUDA/HIP tensors")
+
+    M, K = A.shape
+    N, K_b = B.shape
+    if K_b != K:
+        raise ValueError(
+            "medium-M dense16 MFMA LDS GEMM K mismatch: "
+            f"A={tuple(A.shape)} B={tuple(B.shape)}"
+        )
+    _check_supported_dense16_shape(M, N, K)
+    config = _choose_mfma_lds_mediumm_config(M, N, K)
+    if config is None:
+        raise ValueError(
+            "unsupported medium-M dense16 MFMA LDS GEMM shape; expected a tuned "
+            f"shape with N divisible by {DENSE16_BLOCK_N} and K divisible by "
+            f"{DENSE16_BLOCK_K}; got M={M}, N={N}, K={K}"
+        )
+
+    block_m, block_n, block_k, warps_m, warps_n, num_buffers = config
+    C = _resolve_output(A, (M, N), out_dtype, out, "medium-M dense16 MFMA LDS GEMM")
+    grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n),)
+    gluon_mm_a16w16_medium_gfx950[grid](
+        A,
+        B,
+        C,
+        C,
+        C,
+        C,
+        C,
+        M,
+        N,
+        K,
+        A.stride(0),
+        A.stride(1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(0),
+        C.stride(1),
+        C.stride(0),
+        C.stride(1),
+        C.stride(0),
+        C.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        WARPS_M=warps_m,
+        WARPS_N=warps_n,
+        NUM_BUFFERS=num_buffers,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        ADD3=False,
+        SPLIT_K=1,
+        NUM_XCDS=1,
+        num_warps=warps_m * warps_n,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+
+    if alpha is not None:
+        C.mul_(alpha.to(device=C.device, dtype=C.dtype))
+    return C
+
+
+# Cold-cache sweeps on gfx950 at Kimi K3 TP8, Muse TP4 and Qwen3.8-Flash-Next TP2
+# decode shapes in HIP-graph replays, keyed by (N, K) and then by M bucket: a call
+# uses the config of the smallest bucket covering its M, so M stays a runtime
+# argument within a bucket. A config is (BLOCK_M, BLOCK_N, BLOCK_K, WARPS_M,
+# WARPS_N, NUM_BUFFERS, SPLIT_K, NUM_XCDS); NUM_BUFFERS above three holds every
+# K tile of a program. Only buckets that beat torch.mm by at least 4% are
+# listed; the rest keep the torch path.
+DECODE_M_BUCKETS = (4, 8, 16, 32, 64)
+_DECODE_CONFIGS: dict[
+    tuple[int, int], dict[int, tuple[int, int, int, int, int, int, int, int]]
+] = {
+    # Muse attention output and MoE post-expert projection. One single-pass tile covers all
+    # buckets, so the usual M=2/16 warmup also covers intermediate row counts.
+    (8192, 2048): {
+        4: (32, 32, 256, 2, 2, 3, 1, 8),
+        8: (32, 32, 256, 2, 2, 3, 1, 8),
+        16: (32, 32, 256, 2, 2, 3, 1, 8),
+        32: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
+    (8192, 4096): {
+        4: (32, 32, 256, 2, 2, 3, 1, 8),
+        8: (32, 32, 256, 2, 2, 3, 1, 8),
+        16: (32, 32, 256, 2, 2, 3, 1, 8),
+        32: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
+    # o_proj
+    (7168, 1536): {
+        4: (16, 16, 512, 1, 4, 2, 1, 8),
+        8: (16, 16, 512, 1, 4, 2, 1, 8),
+        16: (16, 32, 256, 1, 4, 3, 1, 1),
+        32: (32, 32, 256, 2, 2, 3, 1, 1),
+        64: (32, 32, 256, 2, 2, 2, 1, 8),
+    },
+    # q_b
+    (2304, 1536): {
+        4: (16, 16, 512, 2, 2, 3, 1, 8),
+        8: (16, 16, 512, 1, 4, 3, 1, 8),
+        16: (16, 16, 512, 1, 4, 3, 1, 8),
+        32: (32, 16, 256, 4, 1, 3, 1, 8),
+        64: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
+    # kv_b
+    (3072, 512): {
+        4: (16, 16, 256, 1, 4, 2, 1, 8),
+        8: (16, 16, 256, 1, 4, 2, 1, 8),
+        16: (16, 16, 256, 1, 4, 2, 1, 1),
+        32: (32, 16, 256, 2, 2, 2, 1, 8),
+        64: (32, 32, 256, 2, 2, 2, 1, 8),
+    },
+    # mla_qkv
+    (3648, 7168): {
+        4: (16, 16, 512, 1, 4, 2, 2, 1),
+        32: (32, 32, 256, 2, 2, 3, 2, 1),
+        64: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
+    # qkvfab
+    (6288, 7168): {
+        4: (16, 32, 256, 2, 2, 3, 1, 1),
+        8: (16, 32, 256, 2, 2, 3, 1, 1),
+        32: (32, 32, 256, 2, 2, 3, 1, 1),
+    },
+    # shared_gu
+    (1536, 7168): {
+        4: (16, 16, 256, 2, 2, 3, 7, 1),
+        8: (16, 16, 256, 1, 4, 3, 7, 8),
+        16: (16, 16, 256, 2, 2, 2, 7, 8),
+        32: (32, 32, 256, 2, 2, 3, 4, 1),
+        64: (32, 32, 128, 2, 2, 2, 8, 1),
+    },
+    # shared_dn
+    (7168, 768): {
+        4: (16, 32, 256, 2, 2, 3, 1, 1),
+        8: (16, 16, 256, 1, 4, 3, 1, 8),
+        16: (16, 32, 256, 1, 4, 3, 1, 1),
+        32: (32, 32, 256, 2, 2, 3, 1, 8),
+        64: (32, 32, 256, 2, 2, 2, 1, 8),
+    },
+    # router
+    (896, 7168): {
+        4: (16, 16, 512, 2, 2, 2, 7, 1),
+        8: (16, 16, 512, 2, 2, 2, 7, 1),
+        16: (16, 32, 512, 2, 2, 2, 7, 8),
+        32: (32, 32, 256, 2, 2, 3, 7, 8),
+        64: (32, 32, 256, 2, 2, 3, 4, 8),
+    },
+    # dense_gu
+    (8448, 7168): {
+        16: (16, 128, 64, 1, 4, 3, 7, 1),
+        32: (32, 32, 64, 2, 2, 2, 4, 8),
+    },
+    # dense_dn
+    (7168, 4224): {
+        4: (16, 32, 128, 1, 4, 3, 1, 1),
+        8: (16, 32, 64, 1, 4, 3, 2, 1),
+        16: (16, 32, 64, 1, 4, 3, 2, 1),
+        32: (32, 32, 64, 2, 2, 3, 2, 1),
+    },
+    # lm_head
+    (20480, 7168): {
+        4: (16, 32, 64, 2, 2, 3, 1, 1),
+        8: (16, 32, 64, 2, 2, 3, 1, 1),
+        16: (16, 32, 64, 1, 4, 3, 1, 8),
+    },
+    # lat_up
+    (7168, 3584): {
+        4: (16, 16, 512, 4, 1, 2, 1, 8),
+        8: (16, 16, 512, 2, 2, 2, 1, 1),
+        16: (16, 32, 256, 1, 4, 3, 1, 1),
+        32: (32, 32, 256, 2, 2, 3, 1, 1),
+    },
+    # lat_dn
+    (3584, 7168): {
+        16: (16, 32, 256, 1, 4, 3, 2, 1),
+        32: (32, 32, 256, 2, 2, 3, 2, 1),
+        64: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
+    # Qwen3.8-Flash-Next TP2 per-rank projections. Its hyper-connection mix
+    # GEMMs run inside gluon_hyperconnection_mix_gfx950 at decode sizes.
+    # Gated DeltaNet out_proj and attention o_proj.
+    (2560, 3072): {
+        16: (16, 64, 256, 1, 4, 3, 4, 1),
+        32: (32, 32, 64, 2, 2, 6, 8, 1),
+    },
+    # MTP embedding and hidden-state fc.
+    (2560, 2560): {
+        16: (16, 64, 256, 1, 4, 2, 5, 8),
+        32: (32, 32, 64, 2, 2, 8, 5, 1),
+        64: (32, 32, 256, 2, 2, 3, 1, 1),
+    },
+    # MoE router gate.
+    (512, 2560): {
+        4: (16, 64, 64, 1, 4, 5, 8, 8),
+        8: (16, 64, 256, 1, 4, 2, 5, 1),
+        16: (16, 64, 64, 1, 4, 5, 8, 8),
+        32: (32, 32, 64, 2, 2, 8, 5, 1),
+        64: (64, 16, 256, 4, 1, 2, 5, 1),
+    },
+    # DeepSeek V4.1 MoE router gate (FP32 output), any TP.
+    (384, 5120): {
+        4: (16, 64, 256, 1, 4, 2, 10, 1),
+        8: (16, 64, 256, 1, 4, 2, 10, 1),
+        16: (16, 64, 256, 1, 4, 2, 10, 1),
+        32: (32, 32, 512, 2, 2, 2, 5, 1),
+        64: (32, 32, 512, 2, 2, 2, 5, 8),
+    },
+    # QSA indexer query/key projection.
+    (640, 2560): {
+        4: (16, 64, 128, 1, 4, 4, 5, 8),
+        8: (16, 64, 64, 1, 4, 5, 8, 1),
+        16: (16, 64, 256, 1, 4, 2, 5, 1),
+        32: (32, 32, 64, 2, 2, 8, 5, 8),
+        64: (32, 32, 64, 2, 2, 8, 5, 1),
+    },
+}
+DECODE_MIN_M = 2
+
+
+def _choose_decode_config(
+    M: int, N: int, K: int
+) -> tuple[int, int, int, int, int, int, int, int] | None:
+    if M < DECODE_MIN_M or M > DECODE_M_BUCKETS[-1]:
+        return None
+    bucket = next(bound for bound in DECODE_M_BUCKETS if M <= bound)
+    return _DECODE_CONFIGS.get((N, K), {}).get(bucket)
+
+
+def supports_gluon_mm_a16w16_decode_gfx950(M: int, N: int, K: int) -> bool:
+    """Whether the decode GEMM has a measured config beating torch.mm here."""
+    return _choose_decode_config(M, N, K) is not None
+
+
+def gluon_mm_a16w16_decode_num_counters_gfx950(M: int, N: int, K: int) -> int:
+    """Split-K arrival counters a decode GEMM launch needs; 0 without split-K."""
+    config = _choose_decode_config(M, N, K)
+    if config is None or config[6] == 1:
+        return 0
+    return triton.cdiv(M, config[0]) * triton.cdiv(N, config[1])
+
+
+def launch_gluon_mm_a16w16_decode_gfx950(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out_dtype: torch.dtype,
+    *,
+    counters: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute decode-sized dense ``A @ B.T`` with measured split-K tiling.
+
+    Args:
+        A: Contiguous fp16/bf16 activation ``[M, K]``.
+        B: Contiguous weight ``[N, K]`` with ``A``'s dtype.
+        out_dtype: Output dtype: ``A``'s dtype or fp32.
+        counters: Zeroed int32 split-K arrival counters, at least
+            ``gluon_mm_a16w16_decode_num_counters_gfx950(M, N, K)`` of them;
+            the launch leaves them zeroed (see ``splitk.py``).
+        out: Optional ``[M, N]`` destination with unit inner stride.
+
+    Returns:
+        ``[M, N]`` product in ``out_dtype``.
+    """
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError(
+            f"decode dense16 GEMM expects 2D inputs, got {A.ndim=} {B.ndim=}"
+        )
+    if A.dtype not in _SUPPORTED_DTYPES or B.dtype != A.dtype:
+        raise TypeError(
+            f"decode dense16 GEMM expects matching fp16/bf16 inputs, got {A.dtype=} "
+            f"{B.dtype=}"
+        )
+    if out_dtype not in (A.dtype, torch.float32):
+        raise TypeError(
+            f"decode dense16 GEMM writes {A.dtype} or fp32, got {out_dtype=}"
+        )
+    if not A.is_cuda or not B.is_cuda:
+        raise ValueError("decode dense16 GEMM requires CUDA/HIP tensors")
+    if not A.is_contiguous() or not B.is_contiguous():
+        raise ValueError("decode dense16 GEMM requires contiguous inputs")
+    M, K = A.shape
+    N, K_b = B.shape
+    if K_b != K:
+        raise ValueError(
+            f"decode dense16 GEMM K mismatch: A={tuple(A.shape)} B={tuple(B.shape)}"
+        )
+    config = _choose_decode_config(M, N, K)
+    if config is None:
+        raise ValueError(
+            f"decode dense16 GEMM has no measured config for M={M}, N={N}, K={K}"
+        )
+
+    block_m, block_n, block_k, warps_m, warps_n, num_buffers, split_k, num_xcds = config
+    C = _resolve_output(A, (M, N), out_dtype, out, "decode dense16 GEMM")
+    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    if split_k > 1:
+        check_splitk_counters(
+            counters, num_tiles, A.device, "gfx950 decode dense16 GEMM"
+        )
+        partial = _get_partial_scratch(A.device, num_tiles, split_k, block_n, block_m)
+    else:
+        partial = counters = C
+    gluon_mm_a16w16_medium_gfx950[(num_tiles * split_k,)](
+        A,
+        B,
+        C,
+        C,
+        C,
+        partial,
+        counters,
+        M,
+        N,
+        K,
+        A.stride(0),
+        A.stride(1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(0),
+        C.stride(1),
+        C.stride(0),
+        C.stride(1),
+        C.stride(0),
+        C.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        WARPS_M=warps_m,
+        WARPS_N=warps_n,
+        NUM_BUFFERS=num_buffers,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        ADD3=False,
+        SPLIT_K=split_k,
+        NUM_XCDS=num_xcds,
+        num_warps=warps_m * warps_n,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+    return C
+
+
+_GROUPED_M_BUCKETS = DECODE_M_BUCKETS + (128,)
+# Grouped decode GEMMs keyed by (groups, N, K), then M bucket; same tuple
+# layout as _DECODE_CONFIGS. Swept under graph replay on MI350X.
+_GROUPED_DECODE_CONFIGS: dict[
+    tuple[int, int, int], dict[int, tuple[int, int, int, int, int, int, int, int]]
+] = {
+    # DeepSeek V4.1 wo_a at TP4: two 1024x4096 groups.
+    (2, 1024, 4096): {
+        4: (16, 64, 256, 1, 4, 3, 4, 1),
+        8: (16, 64, 256, 1, 4, 3, 4, 1),
+        16: (16, 64, 256, 1, 4, 3, 4, 1),
+        32: (32, 32, 512, 2, 2, 2, 4, 1),
+        64: (32, 32, 512, 2, 2, 2, 2, 8),
+        128: (32, 32, 64, 2, 2, 3, 4, 8),
+    },
+}
+
+
+def _choose_grouped_decode_config(
+    M: int, G: int, N: int, K: int
+) -> tuple[int, int, int, int, int, int, int, int] | None:
+    if M < 1 or M > _GROUPED_M_BUCKETS[-1]:
+        return None
+    bucket = next(bound for bound in _GROUPED_M_BUCKETS if M <= bound)
+    return _GROUPED_DECODE_CONFIGS.get((G, N, K), {}).get(bucket)
+
+
+def supports_gluon_grouped_mm_a16w16_decode_gfx950(
+    M: int, G: int, N: int, K: int
+) -> bool:
+    """Whether the grouped decode GEMM has a measured config here."""
+    return _choose_grouped_decode_config(M, G, N, K) is not None
+
+
+def gluon_grouped_mm_a16w16_decode_num_counters_gfx950(
+    M: int, G: int, N: int, K: int
+) -> int:
+    """Split-K arrival counters a grouped decode launch needs; 0 without split-K."""
+    config = _choose_grouped_decode_config(M, G, N, K)
+    if config is None or config[6] == 1:
+        return 0
+    return G * triton.cdiv(M, config[0]) * triton.cdiv(N, config[1])
+
+
+def launch_gluon_grouped_mm_a16w16_decode_gfx950(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    counters: torch.Tensor,
+    quantize: bool,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Compute ``out[:, g] = x[:, g] @ weight[g].T`` for every group in one launch.
+
+    With ``quantize``, return instead the group-32 E4M3 codes ``[M, G * N]``
+    and uint8 UE8M0 scales ``[M, G * N / 32]`` of the BF16 result (``out``
+    must be None).
+
+    Args:
+        x: BF16/FP16 ``[M, G, K]`` with unit inner stride; token and group
+            strides are free (e.g. a slice of padded attention heads).
+        weight: Contiguous ``[G, N, K]`` weight in ``x``'s dtype.
+        counters: Zeroed int32 split-K counters, at least
+            ``gluon_grouped_mm_a16w16_decode_num_counters_gfx950`` of them; the
+            launch leaves them zeroed.
+        out: Optional contiguous ``[M, G, N]`` destination.
+
+    Returns:
+        ``[M, G, N]`` in ``x``'s dtype, or (codes, scales) with ``quantize``.
+    """
+    if x.ndim != 3 or weight.ndim != 3:
+        raise ValueError("grouped decode GEMM expects [M, G, K] and [G, N, K]")
+    M, G, K = x.shape
+    if weight.shape[0] != G or weight.shape[2] != K:
+        raise ValueError("grouped decode GEMM group/K mismatch")
+    N = weight.shape[1]
+    if x.dtype not in _SUPPORTED_DTYPES or weight.dtype != x.dtype:
+        raise TypeError("grouped decode GEMM expects matching fp16/bf16 operands")
+    if not x.is_cuda or weight.device != x.device:
+        raise ValueError("grouped decode GEMM requires colocated GPU tensors")
+    if (
+        x.stride(2) != 1
+        or x.stride(0) % 8
+        or x.stride(1) % 8
+        or x.data_ptr() % 16
+        or not weight.is_contiguous()
+    ):
+        raise ValueError("grouped decode GEMM needs 16-byte aligned rows")
+    config = _choose_grouped_decode_config(M, G, N, K)
+    if config is None:
+        raise ValueError(
+            f"grouped decode GEMM has no config for M={M} G={G} N={N} K={K}"
+        )
+    block_m, block_n, block_k, warps_m, warps_n, num_buffers, split_k, num_xcds = config
+    scales = None
+    if quantize:
+        if out is not None or N % block_n or block_n % 32:
+            raise ValueError(
+                "quantized grouped decode GEMM needs whole 32-column tiles"
+            )
+        out = torch.empty((M, G, N), dtype=torch.float8_e4m3fn, device=x.device)
+        scales = torch.empty((M, G * N // 32), dtype=torch.uint8, device=x.device)
+    elif out is None:
+        out = torch.empty((M, G, N), dtype=x.dtype, device=x.device)
+    elif out.shape != (M, G, N) or out.dtype != x.dtype or not out.is_contiguous():
+        raise ValueError("grouped decode GEMM out must be contiguous [M, G, N]")
+    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    if split_k > 1:
+        check_splitk_counters(
+            counters, G * num_tiles, x.device, "gfx950 grouped decode GEMM"
+        )
+        partial = _get_partial_scratch(
+            x.device, G * num_tiles, split_k, block_n, block_m
+        )
+    else:
+        partial = counters = out
+    gluon_mm_a16w16_medium_gfx950[(G * num_tiles * split_k,)](
+        x,
+        weight,
+        out,
+        out,
+        out,
+        partial,
+        counters,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(2),
+        weight.stride(2),
+        weight.stride(1),
+        out.stride(0),
+        out.stride(2),
+        0,
+        0,
+        0,
+        0,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        WARPS_M=warps_m,
+        WARPS_N=warps_n,
+        NUM_BUFFERS=num_buffers,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        ADD3=False,
+        SPLIT_K=split_k,
+        NUM_XCDS=num_xcds,
+        GROUPS=G,
+        STRIDE_AG=x.stride(1),
+        STRIDE_BG=weight.stride(0),
+        STRIDE_CG=out.stride(1),
+        scale_ptr=scales,
+        STRIDE_SM=G * N // 32,
+        STRIDE_SG=N // 32,
+        QUANT_OUT=quantize,
+        num_warps=warps_m * warps_n,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+    return (out.view(M, G * N), scales) if quantize else out
+
+
+def supports_gluon_mm_a16w16_decode_add3_gfx950(M: int, N: int, K: int) -> bool:
+    """Whether the decode GEMM can fuse two addends into its epilogue here.
+
+    The addends are added once the full K reduction is in registers, so only
+    measured decode configs without split-K qualify.
+    """
+    config = _choose_decode_config(M, N, K)
+    return config is not None and config[6] == 1
+
+
+def launch_gluon_mm_a16w16_decode_add3_gfx950(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    addend_a: torch.Tensor,
+    addend_b: torch.Tensor,
+) -> torch.Tensor:
+    """Compute decode-sized ``A @ B.T + addend_a + addend_b`` in one launch.
+
+    Uses the decode GEMM's measured tile for ``M`` and adds both addends to
+    the FP32 accumulator before the single BF16 rounding.
+
+    Args:
+        A: Contiguous fp16/bf16 activation ``[M, K]``.
+        B: Contiguous weight ``[N, K]`` with ``A``'s dtype.
+        addend_a: ``[M, N]`` addend with ``A``'s dtype and unit inner stride;
+            its row stride is free, so a column slice is accepted.
+        addend_b: Second addend with the same contract as ``addend_a``.
+
+    Returns:
+        ``[M, N]`` sum in ``A``'s dtype.
+    """
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError(
+            f"decode dense16 add3 expects 2D inputs, got {A.ndim=} {B.ndim=}"
+        )
+    if A.dtype not in _SUPPORTED_DTYPES or not A.is_cuda:
+        raise ValueError("decode dense16 add3 requires CUDA/HIP fp16 or bf16 tensors")
+    if not A.is_contiguous() or not B.is_contiguous():
+        raise ValueError("decode dense16 add3 requires contiguous GEMM inputs")
+    M, K = A.shape
+    N, K_b = B.shape
+    if K_b != K:
+        raise ValueError(
+            f"decode dense16 add3 K mismatch: A={tuple(A.shape)} B={tuple(B.shape)}"
+        )
+    for name, tensor in (
+        ("B", B),
+        ("addend_a", addend_a),
+        ("addend_b", addend_b),
+    ):
+        if tensor.device != A.device or tensor.dtype != A.dtype:
+            raise ValueError(
+                f"decode dense16 add3 {name} must match A dtype and device"
+            )
+    for name, tensor in (("addend_a", addend_a), ("addend_b", addend_b)):
+        if tensor.shape != (M, N) or tensor.stride(1) != 1:
+            raise ValueError(
+                f"decode dense16 add3 {name} must have shape [{M}, {N}] "
+                "and unit inner stride"
+            )
+    if not supports_gluon_mm_a16w16_decode_add3_gfx950(M, N, K):
+        raise ValueError(
+            f"decode dense16 add3 has no measured single-pass config for "
+            f"M={M}, N={N}, K={K}"
+        )
+
+    block_m, block_n, block_k, warps_m, warps_n, num_buffers, _, num_xcds = (
+        _choose_decode_config(M, N, K)
+    )
+    C = A.new_empty((M, N))
+    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    gluon_mm_a16w16_medium_gfx950[(num_tiles,)](
+        A,
+        B,
+        C,
+        addend_a,
+        addend_b,
+        C,
+        C,
+        M,
+        N,
+        K,
+        A.stride(0),
+        A.stride(1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(0),
+        C.stride(1),
+        addend_a.stride(0),
+        addend_a.stride(1),
+        addend_b.stride(0),
+        addend_b.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        WARPS_M=warps_m,
+        WARPS_N=warps_n,
+        NUM_BUFFERS=num_buffers,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        ADD3=True,
+        SPLIT_K=1,
+        NUM_XCDS=num_xcds,
+        num_warps=warps_m * warps_n,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+    return C

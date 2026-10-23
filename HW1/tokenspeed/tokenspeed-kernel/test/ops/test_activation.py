@@ -1,0 +1,538 @@
+from __future__ import annotations
+
+import pytest
+import tokenspeed_kernel.ops.activation.triton as activation_triton
+import torch
+from tokenspeed_kernel.numerics.torch.activation import (
+    torch_fused_gate_sigmoid_mul_add,
+    torch_fused_swiglu_fp8_ue8m0,
+    torch_relu2,
+    torch_sigmoid_mul,
+    torch_silu_and_mul,
+    torch_situ_and_mul,
+    torch_swiglu_oai,
+)
+from tokenspeed_kernel.ops.activation.triton import (
+    _relu2_kernel,
+    fused_gate_sigmoid_mul_add,
+    relu2,
+    sigmoid_mul,
+    silu_and_mul,
+    situ_and_mul,
+    swiglu_oai,
+)
+from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from utils import assert_no_triton_compile
+
+platform = current_platform()
+torch.manual_seed(42)
+
+pytestmark = pytest.mark.skipif(
+    not (platform.is_nvidia or platform.is_amd),
+    reason="Triton activation tests require an NVIDIA or AMD GPU.",
+)
+
+
+@pytest.fixture(autouse=True)
+def disable_pdl():
+    previous = pdl_enabled()
+    pdl_enabled(overwrite=False)
+    yield
+    pdl_enabled(overwrite=previous)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    "shape",
+    # Qwen3.5 attn_output_gate decode shapes (num_tokens, num_heads * head_dim).
+    [(1, 4096), (17, 6144), (128, 4096), (256, 8192)],
+)
+def test_sigmoid_mul_matches_eager(
+    dtype: torch.dtype, shape: tuple[int, int], device: str
+) -> None:
+    x = torch.randn(shape, device=device, dtype=dtype)
+    gate = torch.randn(shape, device=device, dtype=dtype)
+    ref = torch_sigmoid_mul(x, gate, None)
+
+    out = sigmoid_mul(x.clone(), gate)
+
+    tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
+    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+def test_sigmoid_mul_is_inplace(device: str) -> None:
+    x = torch.randn(8, 256, device=device, dtype=torch.bfloat16)
+    gate = torch.randn_like(x)
+    same = sigmoid_mul(x, gate)
+    assert same.data_ptr() == x.data_ptr()
+
+
+def test_sigmoid_mul_empty(device: str) -> None:
+    x = torch.empty(0, 256, device=device, dtype=torch.bfloat16)
+    gate = torch.empty_like(x)
+    out = sigmoid_mul(x, gate)
+    assert out.shape == x.shape
+
+
+def test_sigmoid_mul_rejects_shape_mismatch(device: str) -> None:
+    x = torch.randn(4, 32, device=device, dtype=torch.bfloat16)
+    gate = torch.randn(4, 16, device=device, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="shape mismatch"):
+        sigmoid_mul(x, gate)
+
+
+def test_sigmoid_mul_rejects_dtype_mismatch(device: str) -> None:
+    x = torch.randn(4, 32, device=device, dtype=torch.bfloat16)
+    gate = torch.randn(4, 32, device=device, dtype=torch.float16)
+    with pytest.raises(ValueError, match="dtype mismatch"):
+        sigmoid_mul(x, gate)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,head_dim",
+    # qwen3.5 attn_output_gate variants: q=16/kv=2/d=256 (base default) plus
+    # head_dim=128 fall-backs.
+    [(16, 2, 256), (32, 8, 128), (40, 8, 128), (48, 8, 128)],
+)
+def test_sigmoid_mul_strided_gate_from_qkv_split(
+    dtype: torch.dtype,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    device: str,
+) -> None:
+    """Runtime path: gate is the [T, H, D] strided view obtained via
+    ``qkv.split`` → ``.view(T, H, 2*D)`` → ``torch.chunk(q_gate, 2, dim=-1)``.
+    ``gate.stride(0)`` is the full qkv row width (q_size*2 + 2*kv_size),
+    not just H*2*D. The kernel must read this strided view directly without
+    a contiguous copy."""
+    num_tokens = 19
+    q_size = num_heads * head_dim
+    kv_size = num_kv_heads * head_dim
+    qkv = torch.randn(num_tokens, 2 * q_size + 2 * kv_size, device=device, dtype=dtype)
+    q_gate, _k, _v = qkv.split([2 * q_size, kv_size, kv_size], dim=-1)
+    q_gate = q_gate.view(num_tokens, num_heads, 2 * head_dim)
+    _q, gate = torch.chunk(q_gate, 2, dim=-1)
+    # Lock in the production-shape stride: row stride is the full qkv width.
+    assert not gate.is_contiguous()
+    assert gate.stride(0) == 2 * q_size + 2 * kv_size
+    assert gate.stride(-1) == 1
+
+    x = torch.randn(num_tokens, q_size, device=device, dtype=dtype)
+    ref = x.to(torch.float32) * gate.reshape(num_tokens, -1).to(torch.float32).sigmoid()
+    ref = ref.to(dtype)
+
+    out = sigmoid_mul(x.clone(), gate)
+
+    tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
+    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+def test_sigmoid_mul_rejects_4d_gate(device: str) -> None:
+    x = torch.randn(4, 32, device=device, dtype=torch.bfloat16)
+    gate = torch.randn(4, 2, 4, 4, device=device, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="gate must be 2D or 3D"):
+        sigmoid_mul(x, gate)
+
+
+def _headed_gate(
+    layout: str, tokens: int, heads: int, head_dim: int, dtype: torch.dtype, device
+) -> torch.Tensor:
+    """A gate for ``[tokens, heads * head_dim]``: 2D, 3D, or the strided 3D gate
+    half of a packed ``[tokens, heads, 2 * head_dim]`` tensor."""
+    packed = (4 * torch.randn(tokens, heads, 2 * head_dim, device=device)).to(dtype)
+    gate = packed[..., head_dim:]
+    if layout == "strided":
+        return gate
+    gate = gate.contiguous()
+    return gate.reshape(tokens, -1) if layout == "2d" else gate
+
+
+@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("layout", ["2d", "3d", "strided"])
+def test_sigmoid_mul_head_bias_matches_eager(
+    layout: str, dtype: torch.dtype, bias_dtype: torch.dtype, device: str
+) -> None:
+    tokens, heads, head_dim = 19, 8, 128
+    x = torch.randn(tokens, heads * head_dim, device=device, dtype=dtype)
+    gate = _headed_gate(layout, tokens, heads, head_dim, dtype, device)
+    bias = torch.randn(heads, device=device)
+    # Saturate two heads to cover exp overflow and underflow.
+    bias[:2] = torch.tensor([100.0, -100.0])
+    bias = bias.to(bias_dtype)
+    ref = torch_sigmoid_mul(x, gate, bias)
+
+    out = sigmoid_mul(x.clone(), gate, head_bias=bias)
+
+    # On NVIDIA the kernel rounds each FP32 operation as the eager expression does.
+    tol = 0 if platform.is_nvidia else (1e-2 if dtype == torch.bfloat16 else 5e-3)
+    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("head_bias", [False, True])
+@pytest.mark.parametrize("layout", ["2d", "3d", "strided"])
+def test_sigmoid_mul_launch_arguments(
+    layout: str, head_bias: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Host side only, with the launch recorded: without ``head_bias`` the launch
+    is the one existing callers had; with it the bias and the per-head split of a
+    2D gate reach the kernel."""
+    launches = []
+
+    class _Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: launches.append((args, kwargs))
+
+    monkeypatch.setattr(activation_triton, "_sigmoid_mul_kernel", _Kernel())
+    tokens, heads, head_dim = 3, 4, 64
+    gate = _headed_gate(layout, tokens, heads, head_dim, torch.bfloat16, "cpu")
+    x = torch.randn(tokens, heads * head_dim, dtype=torch.bfloat16)
+    bias = torch.randn(heads) if head_bias else None
+
+    assert sigmoid_mul(x, gate, bias) is x
+
+    ((args, kwargs),) = launches
+    assert args[0] is x and args[1] is gate and args[2] == x.numel()
+    assert args[3] is bias
+    width = heads * head_dim
+    split_2d = head_dim if head_bias else width
+    assert kwargs == {
+        "hidden_dim": width,
+        "head_dim": split_2d if layout == "2d" else head_dim,
+        "gate_row_stride": gate.stride(0),
+        "gate_head_stride": split_2d if layout == "2d" else gate.stride(1),
+        "BLOCK_SIZE": 1024,
+        "ENABLE_PDL": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "gate_shape,bias,match",
+    [
+        ((4, 4, 8), torch.ones(2), "num_heads mismatch"),
+        ((4, 32), torch.ones(5), "hidden_dim mismatch"),
+        ((4, 32), torch.ones(0), "hidden_dim mismatch"),
+        ((4, 4, 8), torch.ones(4, 2)[:, 0], "contiguous 1D"),
+        ((4, 4, 8), torch.ones(1, 4), "contiguous 1D"),
+        ((4, 4, 8), torch.ones(4, dtype=torch.int32), "bf16, fp16 or fp32"),
+    ],
+    ids=["3d_heads", "2d_split", "empty", "strided", "2d_bias", "int32"],
+)
+def test_sigmoid_mul_rejects_bad_head_bias(
+    gate_shape: tuple[int, ...], bias: torch.Tensor, match: str
+) -> None:
+    # Host-side checks run before any launch, so CPU tensors suffice.
+    x = torch.randn(4, 32, dtype=torch.bfloat16)
+    gate = torch.randn(gate_shape, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=match):
+        sigmoid_mul(x, gate, head_bias=bias)
+
+
+# --- silu_and_mul tests ---
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("shape", [(1, 7168 * 2), (17, 1024), (128, 9216 * 2)])
+def test_silu_and_mul_matches_eager(
+    dtype: torch.dtype, shape: tuple[int, int], device: str
+) -> None:
+    x = torch.randn(shape, device=device, dtype=dtype)
+    ref = torch_silu_and_mul(x, None)
+
+    out = silu_and_mul(x)
+
+    tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
+    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+def test_silu_and_mul_writes_provided_output(device: str) -> None:
+    x = torch.randn(8, 512, device=device, dtype=torch.bfloat16)
+    out = torch.empty(8, 256, device=device, dtype=torch.bfloat16)
+    same = silu_and_mul(x, out)
+    assert same.data_ptr() == out.data_ptr()
+
+
+def test_silu_and_mul_applies_glm_clamp(device: str) -> None:
+    x = torch.randn(17, 512, device=device, dtype=torch.bfloat16) * 20
+    ref = torch_silu_and_mul(x, 10.0)
+
+    out = silu_and_mul(x, limit=10.0)
+
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+def test_silu_and_mul_empty(device: str) -> None:
+    x = torch.empty(0, 512, device=device, dtype=torch.bfloat16)
+    out = silu_and_mul(x)
+    assert out.shape == (0, 256)
+
+
+def test_silu_and_mul_rejects_bad_output_shape(device: str) -> None:
+    x = torch.randn(4, 512, device=device, dtype=torch.bfloat16)
+    out = torch.empty(4, 128, device=device, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="out shape"):
+        silu_and_mul(x, out)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_swiglu_oai_matches_reference(dtype: torch.dtype, device: str) -> None:
+    x = torch.randn(17, 256, device=device, dtype=dtype)
+    ref = torch_swiglu_oai(x, 1.702, 7.0)
+
+    out = swiglu_oai(x, alpha=1.702, limit=7.0)
+
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# --- situ_and_mul tests ---
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_tokens", [1, 17, 128])
+@pytest.mark.parametrize("linear_beta", [None, 25.0])
+def test_situ_and_mul_matches_eager_latent_moe_shape(
+    dtype: torch.dtype,
+    num_tokens: int,
+    linear_beta: float | None,
+    device: str,
+) -> None:
+    x = torch.randn(num_tokens, 2 * 3072, device=device, dtype=dtype)
+    ref = torch_situ_and_mul(x, 4.0, linear_beta)
+
+    out = situ_and_mul(x, beta=4.0, linear_beta=linear_beta)
+
+    tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
+    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+def test_situ_and_mul_writes_provided_output(device: str) -> None:
+    x = torch.randn(8, 512, device=device, dtype=torch.bfloat16)
+    out = torch.empty(8, 256, device=device, dtype=torch.bfloat16)
+    same = situ_and_mul(x, out, beta=4.0, linear_beta=25.0)
+    assert same.data_ptr() == out.data_ptr()
+
+
+def test_situ_and_mul_writes_noncontiguous_output(device: str) -> None:
+    x = torch.randn(2, 3, 64, device=device, dtype=torch.bfloat16)
+    expected = torch_situ_and_mul(x, 4.0, 25.0)
+
+    backing = torch.empty(3, 2, 32, device=device, dtype=x.dtype)
+    out = backing.permute(1, 0, 2)
+    assert not out.is_contiguous()
+    assert out.stride(-1) == 1
+
+    same = situ_and_mul(x, out, beta=4.0, linear_beta=25.0)
+
+    assert same.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+
+def test_situ_and_mul_rejects_invalid_beta(device: str) -> None:
+    x = torch.randn(1, 64, device=device, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="beta must be positive"):
+        situ_and_mul(x, beta=0.0)
+
+
+# --- fused_gate_sigmoid_mul_add tests ---
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "num_tokens,hidden_dim",
+    [(1, 3584), (1, 5120), (17, 3584), (128, 5120), (256, 3584)],
+)
+def test_fused_gate_sigmoid_mul_add_matches_eager(
+    dtype: torch.dtype, num_tokens: int, hidden_dim: int, device: str
+) -> None:
+    hidden_states = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+    gate_weight = torch.randn(hidden_dim, device=device, dtype=dtype)
+    shared_output = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+    final = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
+
+    ref = torch_fused_gate_sigmoid_mul_add(
+        hidden_states, gate_weight, shared_output, final
+    )
+
+    out = fused_gate_sigmoid_mul_add(
+        hidden_states,
+        gate_weight,
+        shared_output.clone(),
+        final.clone(),
+    )
+
+    tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
+    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+def test_fused_gate_sigmoid_mul_add_is_inplace(device: str) -> None:
+    hidden_states = torch.randn(8, 256, device=device, dtype=torch.bfloat16)
+    gate_weight = torch.randn(256, device=device, dtype=torch.bfloat16)
+    shared_output = torch.randn(8, 256, device=device, dtype=torch.bfloat16)
+    final = torch.randn(8, 256, device=device, dtype=torch.bfloat16)
+
+    result = fused_gate_sigmoid_mul_add(
+        hidden_states, gate_weight, shared_output, final
+    )
+    assert result.data_ptr() == final.data_ptr()
+
+
+def test_fused_gate_sigmoid_mul_add_empty(device: str) -> None:
+    hidden_states = torch.empty(0, 256, device=device, dtype=torch.bfloat16)
+    gate_weight = torch.randn(256, device=device, dtype=torch.bfloat16)
+    shared_output = torch.empty(0, 256, device=device, dtype=torch.bfloat16)
+    final = torch.empty(0, 256, device=device, dtype=torch.bfloat16)
+
+    out = fused_gate_sigmoid_mul_add(hidden_states, gate_weight, shared_output, final)
+    assert out.shape == (0, 256)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("linear_beta", [25.0, None])
+@pytest.mark.parametrize("shape", [(1, 1536), (32, 1536), (7, 64)])
+def test_situ_and_mul_matches_reference(
+    shape, linear_beta, dtype: torch.dtype, device: str
+) -> None:
+    torch.manual_seed(1234)
+    x = torch.randn(*shape, device=device, dtype=dtype) * 8
+    got = situ_and_mul(x, beta=4.0, linear_beta=linear_beta)
+    want = torch_situ_and_mul(x, 4.0, linear_beta)
+    # fp32 math either path; outputs may differ by one output-dtype ULP where
+    # the fp32 results straddle a rounding boundary.
+    torch.testing.assert_close(got, want, rtol=1e-2, atol=1e-2)
+    eps = torch.finfo(dtype).eps
+    ulp = eps * want.float().abs().clamp_min(eps)
+    assert bool(((got.float() - want.float()).abs() <= ulp).all())
+
+
+def test_situ_and_mul_noncontiguous_input(device: str) -> None:
+    base = torch.randn(8, 3072, device=device, dtype=torch.bfloat16)
+    x = base[:, ::2].reshape(8, 1536)  # forces the contiguous() path
+    torch.testing.assert_close(
+        situ_and_mul(x, beta=4.0, linear_beta=25.0),
+        torch_situ_and_mul(x.contiguous(), 4.0, 25.0),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+def test_situ_and_mul_preallocated_out(device: str) -> None:
+    x = torch.randn(4, 512, device=device, dtype=torch.bfloat16)
+    out = torch.empty(4, 256, device=device, dtype=torch.bfloat16)
+    result = situ_and_mul(x, out, beta=4.0, linear_beta=25.0)
+    assert result.data_ptr() == out.data_ptr()
+    with pytest.raises(ValueError, match="out shape"):
+        situ_and_mul(
+            x,
+            torch.empty(4, 128, device=device),
+            beta=4.0,
+            linear_beta=25.0,
+        )
+
+
+# --- fused_swiglu_fp8_ue8m0 tests ---
+
+
+def _unpack_ue8m0(packed: torch.Tensor, num_groups: int) -> torch.Tensor:
+    bytes_ = torch.stack(
+        [(packed >> (8 * i)) & 0xFF for i in range(4)], dim=-1
+    ).flatten(-2)[..., :num_groups]
+    return torch.exp2(bytes_.float() - 127.0)
+
+
+@pytest.mark.skipif(not platform.is_nvidia, reason="requires float8_e4m3fn CUDA")
+@pytest.mark.parametrize("shape", [(1, 1024), (7, 1024), (128, 3584), (333, 1280)])
+@pytest.mark.parametrize("limit,alpha,beta", [(0.0, 1.0, 0.0), (7.0, 1.702, 1.0)])
+def test_fused_swiglu_fp8_ue8m0_matches_reference(
+    shape: tuple[int, int], limit: float, alpha: float, beta: float, device: str
+) -> None:
+    from tokenspeed_kernel.ops.activation.triton import fused_swiglu_fp8_ue8m0
+
+    gate_up = torch.randn(shape, device=device, dtype=torch.bfloat16) * 3
+    out, packed_scale = fused_swiglu_fp8_ue8m0(
+        gate_up,
+        swiglu_limit=limit,
+        swiglu_alpha=alpha,
+        swiglu_beta=beta,
+        enable_pdl=False,
+    )
+
+    ref_q, ref_scale = torch_fused_swiglu_fp8_ue8m0(gate_up, limit, alpha, beta)
+    num_groups = out.shape[1] // 128
+    got_scale = _unpack_ue8m0(packed_scale, num_groups)
+
+    torch.testing.assert_close(got_scale, ref_scale, rtol=0, atol=0)
+    dequant = out.float().view(out.shape[0], num_groups, 128) * got_scale[..., None]
+    ref_dequant = ref_q.float().view_as(dequant) * ref_scale[..., None]
+    torch.testing.assert_close(dequant, ref_dequant, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not platform.is_nvidia, reason="requires float8_e4m3fn CUDA")
+def test_fused_swiglu_fp8_ue8m0_partial_pack_keeps_padding_zero(device: str) -> None:
+    """N=640 gives 5 groups: byte 3 of the second packed int32 must stay 0."""
+    from tokenspeed_kernel.ops.activation.triton import fused_swiglu_fp8_ue8m0
+
+    gate_up = torch.randn(16, 1280, device=device, dtype=torch.bfloat16)
+    _, packed_scale = fused_swiglu_fp8_ue8m0(gate_up, enable_pdl=False)
+    tail = packed_scale[:, 1]
+    assert bool(((tail >> 8) == 0).all()), "padding scale bytes must remain zero"
+
+
+@pytest.mark.parametrize("shape", [(1, 5376), (33, 1024), (7, 100)])
+@pytest.mark.parametrize("pdl", [False, True])
+def test_relu2_matches_eager(shape: tuple[int, int], pdl: bool, device: str) -> None:
+    if pdl and not platform.is_hopper_plus:
+        pytest.skip("PDL requires NVIDIA SM90+")
+    pdl_enabled(overwrite=pdl)
+    x = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    out = relu2(x, torch.empty_like(x), fp8_scale=None)
+    torch.cuda.synchronize()
+    assert torch.equal(out, torch_relu2(x))
+
+
+@pytest.mark.skipif(not platform.is_nvidia, reason="requires float8_e4m3fn CUDA")
+@pytest.mark.parametrize("pdl", [False, True])
+def test_relu2_fp8_quantizes_the_bf16_square(pdl: bool, device: str) -> None:
+    """Bit-identical to the BF16 activation followed by the linear's static quantization."""
+    if pdl and not platform.is_hopper_plus:
+        pytest.skip("PDL requires NVIDIA SM90+")
+    pdl_enabled(overwrite=pdl)
+    x = torch.randn(9, 5376, device=device, dtype=torch.bfloat16) * 3
+    # 1.03125**2 rounds to BF16 1.0625 and then FP8 1.0, but straight to FP8 1.125.
+    x[0, :4] = 1.03125
+    scale = torch.tensor([16.0 / 448.0], device=device)
+    for fp8_scale in (scale, torch.ones(1, device=device)):
+        out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        relu2(x, out, fp8_scale=fp8_scale)
+        expected, _ = quantize_fp8(torch.relu(x).square(), scale=fp8_scale)
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.uint8), expected.view(torch.uint8))
+
+
+def test_relu2_in_place_from_strided_rows(device: str) -> None:
+    wide = torch.randn(4, 2048, device=device, dtype=torch.bfloat16)
+    x = wide[:, :1500]
+    expected = torch_relu2(x)
+    untouched = wide[:, 1500:].clone()
+    relu2(x, x, fp8_scale=None)
+    assert torch.equal(x, expected)
+    assert torch.equal(wide[:, 1500:], untouched)
+
+
+def test_relu2_compiles_once_across_batch_sizes(device: str) -> None:
+    x = torch.randn(300, 1536, device=device, dtype=torch.bfloat16)
+    relu2(x[:3], torch.empty_like(x[:3]), fp8_scale=None)
+    with assert_no_triton_compile(_relu2_kernel):
+        for rows in (1, 16, 37, 300):
+            relu2(x[:rows], torch.empty_like(x[:rows]), fp8_scale=None)
+
+
+def test_relu2_contract(device: str) -> None:
+    x = torch.randn(3, 64, device=device, dtype=torch.bfloat16)
+    assert relu2(x[:0], x[:0], fp8_scale=None).shape == (0, 64)
+    with pytest.raises(ValueError, match="FP8 exactly"):
+        relu2(x, torch.empty_like(x), fp8_scale=torch.ones(1, device=device))
+    with pytest.raises(ValueError, match="dense columns"):
+        relu2(x.t(), x.t(), fp8_scale=None)

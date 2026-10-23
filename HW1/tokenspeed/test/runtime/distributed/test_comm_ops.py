@@ -1,0 +1,1010 @@
+"""Tests for comm_ops and comm_backend.
+
+Spawns real distributed workers to test all_reduce, all_gather, reduce_scatter,
+token_all_gather, token_reduce_scatter, fused ops, and backend registry.
+
+Usage:
+    python -m pytest test/runtime/distributed/test_comm_ops.py -v
+"""
+
+import importlib.util
+import socket
+from functools import partial
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+from tokenspeed.runtime.distributed.comm_ops import all_to_all_single
+from tokenspeed.runtime.distributed.mapping import Mapping
+
+
+class TestAutoBackendTopology:
+    @pytest.fixture
+    def backend(self, monkeypatch):
+        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        monkeypatch.setitem(
+            global_server_args_dict,
+            "mapping",
+            SimpleNamespace(nprocs_per_node=4),
+        )
+        backend = AutoBackend.__new__(AutoBackend)
+        backend._nccl = Mock()
+        backend._rsag = Mock()
+        backend._iris = Mock()
+        backend._trtllm_ar = Mock()
+        backend._trtllm_ar.has_trtllm_ar.return_value = False
+        backend._trtllm_ar.lamport_all_gather.return_value = None
+        # A host-spread group's rsag routing keys on the fabric probe, so pin
+        # both the probe and the local device count the tests assume.
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+        return backend
+
+    @staticmethod
+    def _set_fabric(monkeypatch, supported: bool) -> None:
+        import tokenspeed_kernel.ops.communication.fabric as fabric
+
+        monkeypatch.setattr(fabric, "group_has_fabric", lambda ranks: supported)
+
+    def test_group_spans_nodes(self, backend):
+        assert not backend._group_spans_nodes((0, 1, 2, 3))
+        assert not backend._group_spans_nodes((4, 5, 6, 7))
+        assert backend._group_spans_nodes((0, 1, 4, 5))
+
+    @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
+    def test_host_spread_token_ops_without_fabric_use_nccl(
+        self, backend, monkeypatch, method
+    ):
+        self._set_fabric(monkeypatch, False)
+        tensor = Mock()
+        scattered = [1] * 8
+        getattr(backend._nccl, method).return_value = "nccl-result"
+
+        result = getattr(backend, method)(tensor, tuple(range(8)), scattered)
+
+        assert result == "nccl-result"
+        getattr(backend._nccl, method).assert_called_once_with(
+            tensor, tuple(range(8)), scattered
+        )
+        getattr(backend._rsag, method).assert_not_called()
+
+    @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
+    def test_host_spread_token_ops_with_fabric_use_rsag(
+        self, backend, monkeypatch, method
+    ):
+        """An NVLink domain can span hosts; the fabric decides, not the count."""
+        self._set_fabric(monkeypatch, True)
+        tensor = Mock()
+        scattered = [1] * 8
+        getattr(backend._rsag, method).return_value = "rsag-result"
+
+        result = getattr(backend, method)(tensor, tuple(range(8)), scattered)
+
+        assert result == "rsag-result"
+        getattr(backend._nccl, method).assert_not_called()
+
+    @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
+    def test_a_strided_group_smaller_than_one_host_is_still_probed(
+        self, backend, monkeypatch, method
+    ):
+        """``Mapping`` groups are strided, so rank count does not locate them.
+
+        An attention DP group is ``(0, 8)`` at ``attn_tp_size=8``: two ranks,
+        fewer than one host holds, living on two hosts. Sizing it against the
+        local device count would admit it with no probe, and a group the fabric
+        cannot map hangs inside the rendezvous rather than falling back.
+        """
+        groups: list[tuple[int, ...]] = []
+        self._set_fabric(monkeypatch, False)
+        import tokenspeed_kernel.ops.communication.fabric as fabric
+
+        monkeypatch.setattr(
+            fabric,
+            "group_has_fabric",
+            lambda ranks: groups.append(tuple(ranks)) or False,
+        )
+        getattr(backend._nccl, method).return_value = "nccl-result"
+
+        result = getattr(backend, method)(Mock(), (0, 8), [1, 1])
+
+        assert groups == [(0, 8)]
+        assert result == "nccl-result"
+        getattr(backend._rsag, method).assert_not_called()
+
+    @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
+    def test_node_local_token_ops_use_rsag(self, backend, method):
+        tensor = Mock()
+        scattered = [1] * 4
+        getattr(backend._rsag, method).return_value = "rsag-result"
+
+        result = getattr(backend, method)(tensor, (0, 1, 2, 3), scattered)
+
+        assert result == "rsag-result"
+        getattr(backend._rsag, method).assert_called_once_with(
+            tensor, (0, 1, 2, 3), scattered
+        )
+        getattr(backend._nccl, method).assert_not_called()
+
+    def test_cross_node_all_reduce_falls_back_to_nccl(self, backend):
+        # trtllm_ar is still consulted for a cross-node group: its mnnvl
+        # workspace spans nodes, and it is only armed when that succeeded.
+        # NCCL is the fallback for when it is not armed.
+        backend._trtllm_ar.has_trtllm_ar.return_value = False
+        tensor = torch.empty(1)
+        backend._nccl.all_reduce.return_value = "nccl-result"
+
+        result = backend.all_reduce(tensor, tuple(range(8)))
+
+        assert result == "nccl-result"
+        backend._nccl.all_reduce.assert_called_once_with(
+            tensor, tuple(range(8)), op=None
+        )
+        backend._trtllm_ar.has_trtllm_ar.assert_called_once_with(tuple(range(8)))
+        backend._iris.can_run.assert_not_called()
+
+    def test_cross_node_all_reduce_uses_trtllm_when_armed(self, backend):
+        """An armed mnnvl workspace serves cross-node groups directly."""
+        backend._trtllm_ar.has_trtllm_ar.return_value = True
+        backend._trtllm_ar.all_reduce.return_value = "trtllm-result"
+        tensor = torch.empty(1)
+
+        result = backend.all_reduce(tensor, tuple(range(8)))
+
+        assert result == "trtllm-result"
+        backend._nccl.all_reduce.assert_not_called()
+
+    def test_host_spread_last_dim_all_gather_without_fabric_uses_nccl(
+        self, backend, monkeypatch
+    ):
+        self._set_fabric(monkeypatch, False)
+        tensor = Mock()
+        tensor.dim.return_value = 2
+        backend._nccl.all_gather.return_value = "nccl-result"
+
+        result = backend.all_gather(tensor, tuple(range(8)), dim=-1)
+
+        assert result == "nccl-result"
+        backend._nccl.all_gather.assert_called_once_with(tensor, tuple(range(8)), -1)
+        backend._rsag.all_gather.assert_not_called()
+
+    def test_host_spread_last_dim_all_gather_with_fabric_uses_rsag(
+        self, backend, monkeypatch
+    ):
+        self._set_fabric(monkeypatch, True)
+        tensor = Mock()
+        tensor.dim.return_value = 2
+        backend._rsag.all_gather.return_value = "rsag-result"
+
+        result = backend.all_gather(tensor, tuple(range(8)), dim=-1)
+
+        assert result == "rsag-result"
+        backend._nccl.all_gather.assert_not_called()
+
+    def test_last_dim_all_gather_wider_than_the_buffer_takes_nccl(self, monkeypatch):
+        """Rows past the prefill-sized RSAG buffer go to NCCL instead of asserting."""
+        from tokenspeed.runtime.distributed.comm_backend import triton_rsag
+
+        fallback = Mock()
+        fallback.all_gather.return_value = "nccl-result"
+        rsag = triton_rsag.TritonRSAGBackend(fallback=fallback)
+        state = Mock(max_token_num=8192)
+        monkeypatch.setattr(rsag, "_get_or_create", lambda group, hidden: state)
+        monkeypatch.setattr(
+            triton_rsag, "current_platform", lambda: Mock(is_nvidia=True)
+        )
+        inner = Mock(return_value="rsag-result")
+        monkeypatch.setattr(triton_rsag, "all_gather_inner", inner)
+        group = tuple(range(4))
+        wide = torch.empty(27648, 384, dtype=torch.bfloat16)
+        assert rsag.all_gather(wide, group, dim=-1) == "nccl-result"
+        fallback.all_gather.assert_called_once_with(wide, group=group, dim=-1)
+        inner.assert_not_called()
+        fits = torch.empty(8192, 384, dtype=torch.bfloat16)
+        assert rsag.all_gather(fits, group, dim=-1) == "rsag-result"
+        inner.assert_called_once()
+
+    def test_host_spread_all_reduce_still_keys_on_topology(self, backend, monkeypatch):
+        """Fabric governs the rsag paths only: triton_ar stays node-local."""
+        self._set_fabric(monkeypatch, True)
+        backend._trtllm_ar.has_trtllm_ar.return_value = False
+        tensor = torch.empty(1)
+        backend._nccl.all_reduce.return_value = "nccl-result"
+
+        assert backend.all_reduce(tensor, tuple(range(8))) == "nccl-result"
+        backend._iris.can_run.assert_not_called()
+
+
+def test_fabric_map_gathers_world_once_and_serves_groups_locally(monkeypatch):
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    original_tensor = torch.tensor
+    original_empty_like = torch.empty_like
+    monkeypatch.setattr(fabric, "_fabric_map", None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    monkeypatch.setattr(fabric, "fabric_allocation_supported", lambda device: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+    calls = []
+
+    def fake_all_gather(outputs, local, group):
+        calls.append(group)
+        for output, value in zip(outputs, (True, False, True, True), strict=True):
+            output.fill_(value)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    monkeypatch.setattr(torch, "tensor", lambda value, **kwargs: original_tensor(value))
+    monkeypatch.setattr(torch, "empty_like", lambda value: original_empty_like(value))
+
+    assert fabric.gather_fabric_map() == [True, False, True, True]
+    assert fabric.group_has_fabric((0, 2, 3))
+    assert not fabric.group_has_fabric((0, 1))
+    assert calls == [torch.distributed.group.WORLD]
+
+
+@pytest.mark.parametrize("capturing", [True, False])
+def test_a_missing_fabric_map_is_a_wiring_error_capturing_or_not(
+    monkeypatch, capturing
+):
+    """The raise does not depend on capture, and that is the point.
+
+    Outside a capture a missing map used to be gathered lazily, over WORLD.
+    This question is asked at dispatch, where the ranks present are the
+    group's, so that gather would block on world ranks that never arrive.
+    """
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    monkeypatch.setattr(fabric, "_fabric_map", None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather",
+        lambda *args, **kw: pytest.fail("a missing map must not start a collective"),
+    )
+    # Without this the lazy path would die in get_world_size first and the
+    # stub above would never be reached -- a guard that cannot fire.
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *a, **k: 8)
+
+    with pytest.raises(RuntimeError, match="never gathered"):
+        fabric.group_has_fabric((0, 1))
+
+
+def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch):
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    import tokenspeed.runtime.execution.distributed_initializer as initializer
+
+    events = []
+    mapping = Mapping(rank=0, world_size=1)
+    config = SimpleNamespace(
+        device="cuda",
+        gpu_id=0,
+        dist_init_addr=None,
+        nccl_port=1234,
+        emulate_rank_zero=False,
+        distributed_timeout_seconds=10,
+        mapping=mapping,
+        hidden_size=0,
+        world_size=1,
+    )
+    monkeypatch.setattr(
+        torch,
+        "get_device_module",
+        lambda device: SimpleNamespace(set_device=lambda gpu: None),
+    )
+    monkeypatch.setattr(
+        initializer, "get_available_gpu_memory", lambda *args, **kwargs: 1.0
+    )
+    monkeypatch.setattr(
+        initializer, "maybe_set_numa_aware_cpu_affinity", lambda gpu: None
+    )
+    monkeypatch.setattr(
+        initializer.pg_manager,
+        "init_distributed",
+        lambda *args, **kwargs: events.append("distributed"),
+    )
+    monkeypatch.setattr(
+        initializer.pg_manager,
+        "init_process_group",
+        lambda group: events.append("group"),
+    )
+    monkeypatch.setattr(
+        initializer.pg_manager, "get_process_group", lambda backend, group: "pg"
+    )
+    monkeypatch.setattr(fabric, "gather_fabric_map", lambda: events.append("fabric"))
+
+    initializer.DistributedInitializer.initialize(config)
+
+    assert events[0] == "distributed"
+    assert events[-1] == "fabric"
+    assert events.count("fabric") == 1
+
+
+def get_open_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+# ---------------------------------------------------------------------------
+# Worker
+# ---------------------------------------------------------------------------
+
+
+def worker_fn(rank, world_size, port, test_fn, error_dict):
+    try:
+        _worker_main(rank, world_size, port, test_fn)
+    except Exception:
+        import traceback
+
+        error_dict[rank] = traceback.format_exc()
+
+
+def _worker_main(rank, world_size, port, test_fn):
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+
+    group = tuple(range(world_size))
+    pg_manager.init_process_group(group)
+    ref_group = pg_manager.get_process_group("nccl", group)
+
+    _setup_runtime_globals(rank, world_size)
+
+    test_fn(
+        rank=rank,
+        world_size=world_size,
+        device=device,
+        group=group,
+        ref_group=ref_group,
+    )
+
+    dist.destroy_process_group()
+
+
+def _setup_runtime_globals(rank, world_size):
+    """Match the runtime's setup of global_server_args_dict.
+
+    AutoBackend's 2-D last-dim all_gather and all token-aware ops route through
+    TritonRSAGBackend, which sizes its persistent buffers from these globals.
+    """
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    mapping = Mapping(rank=rank, world_size=world_size, attn_tp_size=world_size)
+    global_server_args_dict["mapping"] = mapping
+    global_server_args_dict["chunked_prefill_size"] = 8192
+    global_server_args_dict["max_prefill_tokens"] = 8192
+    global_server_args_dict["max_model_len"] = 4096
+    global_server_args_dict["force_deterministic_rsag"] = True
+
+
+def _run(world_size, test_fn):
+    if world_size > torch.cuda.device_count():
+        pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
+
+    port = get_open_port()
+    error_dict = mp.Manager().dict()
+
+    mp.spawn(
+        worker_fn,
+        args=(world_size, port, test_fn, error_dict),
+        nprocs=world_size,
+        join=True,
+    )
+
+    if error_dict:
+        raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
+
+
+# ---------------------------------------------------------------------------
+# Test functions (run inside each worker)
+# ---------------------------------------------------------------------------
+
+TEST_SIZES = [512, 4096, 32768]
+DTYPES = [torch.float32, torch.float16, torch.bfloat16]
+
+
+def _test_all_reduce(rank, world_size, device, group, ref_group):
+    from tokenspeed.runtime.distributed.comm_ops import all_reduce
+
+    for sz in TEST_SIZES:
+        for dtype in DTYPES:
+            inp = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
+            expected = inp.clone()
+            dist.all_reduce(expected, group=ref_group)
+            result = all_reduce(inp.clone(), group)
+            torch.testing.assert_close(result, expected)
+
+    # 2D
+    for dtype in DTYPES:
+        inp = torch.randint(1, 16, (8, 512), dtype=dtype, device=device)
+        expected = inp.clone()
+        dist.all_reduce(expected, group=ref_group)
+        result = all_reduce(inp.clone(), group)
+        torch.testing.assert_close(result, expected)
+
+    inputs = tuple(
+        torch.randint(1, 16, (size,), dtype=torch.float32, device=device)
+        for size in (8, 12, 16)
+    )
+    expected = tuple(tensor.clone() for tensor in inputs)
+    for tensor in expected:
+        dist.all_reduce(tensor, group=ref_group)
+    results = all_reduce(tuple(tensor.clone() for tensor in inputs), group)
+    for result, reference in zip(results, expected):
+        torch.testing.assert_close(result, reference)
+
+    from tokenspeed_kernel.platform import current_platform
+
+    if not current_platform().is_cdna4 or importlib.util.find_spec("iris") is None:
+        return
+    from tokenspeed.runtime.distributed.comm_backend import get_global_backend
+    from tokenspeed.runtime.distributed.comm_ops import (
+        acquire_all_reduce_outputs,
+        prepare_all_reduce_buffers,
+    )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    previous_force = global_server_args_dict["force_deterministic_rsag"]
+    global_server_args_dict["force_deterministic_rsag"] = False
+    try:
+        backend = get_global_backend().iris
+        capacities = dict(
+            staged_max_numel=512 * 1024,
+            producer_direct_max_numel=1024 * 1024,
+            dtype=torch.bfloat16,
+            backend=None,
+        )
+        assert prepare_all_reduce_buffers(group, **capacities)
+        staged = torch.full((128,), rank + 1, dtype=torch.bfloat16, device=device)
+        torch.testing.assert_close(
+            all_reduce(staged, group),
+            torch.full_like(staged, world_size * (world_size + 1) // 2),
+            atol=0,
+            rtol=0,
+        )
+        states = []
+        for dtype in (torch.bfloat16, torch.float32):
+            shapes = (
+                ((384 * 1024,), (384 * 1024,))
+                if dtype == torch.bfloat16
+                else ((128,), (256,))
+            )
+            like = torch.empty(0, dtype=dtype, device=device)
+            outputs = acquire_all_reduce_outputs(shapes, like, group)
+            state = backend.state(group, dtype)
+            states.append(state)
+            assert state.owns_outputs(outputs)
+            pointer = state.producer.data.data_ptr()
+            for index, output in enumerate(outputs, start=1):
+                output.fill_(index * (rank + 1))
+            results = all_reduce(outputs, group)
+            for index, result in enumerate(results, start=1):
+                torch.testing.assert_close(
+                    result,
+                    torch.full_like(result, index * world_size * (world_size + 1) // 2),
+                    atol=0,
+                    rtol=0,
+                )
+            torch.cuda.synchronize()
+            dist.barrier()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                results = all_reduce(outputs, group)
+            if dtype == torch.bfloat16:
+                assert prepare_all_reduce_buffers(
+                    group,
+                    staged_max_numel=128,
+                    producer_direct_max_numel=256,
+                    dtype=dtype,
+                    backend=None,
+                )
+            for scale in (2, 3):
+                for index, output in enumerate(outputs, start=1):
+                    output.fill_(scale * index * (rank + 1))
+                graph.replay()
+                for index, result in enumerate(results, start=1):
+                    torch.testing.assert_close(
+                        result,
+                        torch.full_like(
+                            result, scale * index * world_size * (world_size + 1) // 2
+                        ),
+                        atol=0,
+                        rtol=0,
+                    )
+            assert backend.state(group, dtype) is state
+            assert state.producer.data.data_ptr() == pointer
+        assert states[0].producer.data.data_ptr() != states[1].producer.data.data_ptr()
+    finally:
+        global_server_args_dict["force_deterministic_rsag"] = previous_force
+
+
+def _test_all_gather(rank, world_size, device, group, ref_group):
+    from tokenspeed.runtime.distributed.comm_ops import all_gather
+
+    for sz in TEST_SIZES:
+        for dtype in DTYPES:
+            inp = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
+            output_list = [torch.empty_like(inp) for _ in range(world_size)]
+            dist.all_gather(output_list, inp, group=ref_group)
+            expected = torch.cat(output_list, dim=0)
+            result = all_gather(inp, group, dim=0)
+            torch.testing.assert_close(result, expected)
+
+    # last dim
+    for dtype in DTYPES:
+        inp = torch.randint(1, 16, (4, 128), dtype=dtype, device=device)
+        output_list = [torch.empty_like(inp) for _ in range(world_size)]
+        dist.all_gather(output_list, inp, group=ref_group)
+        expected = torch.cat(output_list, dim=-1)
+        result = all_gather(inp, group, dim=-1)
+        torch.testing.assert_close(result, expected)
+
+
+def _test_all_gather_single(rank, world_size, device, group, ref_group):
+    from tokenspeed.runtime.distributed.comm_ops import all_gather_single
+
+    for sz in TEST_SIZES:
+        for dtype in DTYPES:
+            inp = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
+            output = torch.empty(sz * world_size, dtype=dtype, device=device)
+            expected = torch.empty_like(output)
+            dist.all_gather_single(expected, inp, group=ref_group)
+            all_gather_single(output, inp, group)
+            torch.testing.assert_close(output, expected)
+
+    # 2D
+    inp = torch.randint(1, 16, (4, 128), dtype=torch.float32, device=device)
+    output = torch.empty(4 * world_size, 128, dtype=torch.float32, device=device)
+    expected = torch.empty_like(output)
+    dist.all_gather_single(expected, inp, group=ref_group)
+    all_gather_single(output, inp, group)
+    torch.testing.assert_close(output, expected)
+
+
+def _test_all_to_all_single(rank, world_size, device, group, ref_group, backend):
+    if backend == "cuda_lamport":
+        _check_lamport_all_to_all(rank, world_size, device, ref_group)
+        return
+    assert backend == "runtime"
+    for sz in TEST_SIZES:
+        for dtype in DTYPES:
+            total = sz * world_size
+            inp = torch.randint(1, 16, (total,), dtype=dtype, device=device)
+            expected = torch.empty_like(inp)
+            dist.all_to_all_single(expected, inp, group=ref_group)
+            output = torch.empty_like(inp)
+            all_to_all_single(output, inp, group)
+            torch.testing.assert_close(output, expected)
+
+    for dtype in DTYPES:
+        rows_per_rank = 4
+        total_rows = rows_per_rank * world_size
+        inp = torch.randint(1, 16, (total_rows, 128), dtype=dtype, device=device)
+        expected = torch.empty_like(inp)
+        dist.all_to_all_single(expected, inp, group=ref_group)
+        output = torch.empty_like(inp)
+        all_to_all_single(output, inp, group)
+        torch.testing.assert_close(output, expected)
+
+
+def _check_lamport_all_to_all(rank, world_size, device, ref_group):
+    # This is a direct kernel check, not a runtime backend registration. The
+    # kernel exchanges channel shards; NCCL expects destination-major input.
+    from tokenspeed_kernel.ops.communication.cuda_lamport import (
+        CudaLamportA2AState,
+        cuda_lamport_a2a,
+    )
+
+    assert world_size == 4
+    torch.manual_seed(1103 + rank)
+    blocks = min(128, torch.cuda.get_device_properties(device).multi_processor_count)
+
+    def reference(x, inverse):
+        if inverse:
+            rows, width = x.shape[0] // world_size, x.shape[1]
+            packed = x.view(world_size, rows, width).contiguous()
+            received = torch.empty_like(packed)
+            dist.all_to_all_single(received, packed, group=ref_group)
+            return received.transpose(0, 1).contiguous().view(rows, world_size * width)
+        rows, channels = x.shape
+        packed = (
+            x.view(rows, world_size, channels // world_size)
+            .transpose(0, 1)
+            .contiguous()
+        )
+        received = torch.empty_like(packed)
+        dist.all_to_all_single(received, packed, group=ref_group)
+        return received.view(world_size * rows, channels // world_size)
+
+    def check_bits(output, expected):
+        torch.testing.assert_close(
+            output.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
+        )
+
+    # Zero threshold disables chunk exchange. Reuse one state while crossing
+    # packet/paired-packet/chunk boundaries, including exactly 4 and 8 MiB.
+    cases = [
+        (channels, [1, 3, 32, 64, 128], 0) for channels in (8, 40, 12288, 16384)
+    ] + [
+        (2048, [1, 1023, 1024, 2048, 2049, 1], 0),
+        (32, [1, 3, 128, 512, 1, 512, 3], 4096),
+        (12288, [1, 3, 128, 512, 1, 512, 3], 8 * 2**20),
+        (2048, [1, 1023, 1024, 2048, 2049, 2048, 1], 8 * 2**20 + 1),
+    ]
+    for channels, row_counts, threshold in cases:
+        state = CudaLamportA2AState(
+            ref_group, max(row_counts), channels, device, blocks
+        )
+        if threshold:
+            state.prepare_chunk_exchange(threshold)
+        for inverse in (False, True, False):
+            for rows in row_counts:
+                shape = (
+                    (world_size * rows, channels // world_size)
+                    if inverse
+                    else (rows, channels)
+                )
+                bits = torch.randint(
+                    -32768, 32768, shape, dtype=torch.int16, device=device
+                )
+                bits.flatten()[:4] = torch.tensor(
+                    [-32768, 0, 32704, -64], dtype=torch.int16, device=device
+                )
+                x = bits.view(torch.bfloat16)
+                call = partial(cuda_lamport_a2a, state, x, inverse)
+                check_bits(call(), reference(x, inverse))
+                sources = [
+                    torch.randint(
+                        -32768, 32768, shape, dtype=torch.int16, device=device
+                    ).view(torch.bfloat16)
+                    for _ in range(9)
+                ]
+                if rank == 0:
+                    for source in sources:
+                        source.zero_()  # Empty logical owner still participates.
+                references = [reference(source, inverse) for source in sources]
+                snapshots = [torch.empty_like(references[0]) for _ in sources]
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    for source, snapshot in zip(sources, snapshots):
+                        x.copy_(source)
+                        if rank == 1:
+                            torch.cuda._sleep(10000)  # Deliberate peer skew.
+                        snapshot.copy_(call())
+                for _ in range(3):
+                    graph.replay()
+                torch.cuda.synchronize(device)
+                for snapshot, expected in zip(snapshots, references):
+                    check_bits(snapshot, expected)
+                del graph, snapshots, sources, references
+
+        # Exercise unsigned generation IDs across the signed-int32 boundary.
+        torch.cuda.synchronize(device)
+        dist.barrier(group=ref_group)
+        state.control[0] = 2**31 - 2
+        if state.chunk_control is not None:
+            state.chunk_control[0] = 2**31 - 2
+        for rows in (row_counts[0], max(row_counts)):
+            x = torch.randn((rows, channels), dtype=torch.bfloat16, device=device)
+            expected = reference(x, False)
+            for _ in range(5):
+                check_bits(cuda_lamport_a2a(state, x, False), expected)
+        torch.cuda.synchronize(device)
+        dist.barrier(group=ref_group)
+        del call, state
+
+
+def _test_reduce_scatter(rank, world_size, device, group, ref_group):
+    from tokenspeed.runtime.distributed.comm_ops import reduce_scatter
+
+    for sz in TEST_SIZES:
+        for dtype in DTYPES:
+            total_sz = sz * world_size
+            inp = torch.randint(1, 16, (total_sz,), dtype=dtype, device=device)
+            expected = torch.empty(sz, dtype=dtype, device=device)
+            dist.reduce_scatter_single(expected, inp, group=ref_group)
+            result = reduce_scatter(inp.clone(), group)
+            torch.testing.assert_close(result, expected)
+
+    # 2D
+    for dtype in DTYPES:
+        total_rows = 16 * world_size
+        inp = torch.randint(1, 16, (total_rows, 128), dtype=dtype, device=device)
+        expected = torch.empty(16, 128, dtype=dtype, device=device)
+        dist.reduce_scatter_single(expected, inp, group=ref_group)
+        result = reduce_scatter(inp.clone(), group)
+        torch.testing.assert_close(result, expected)
+
+
+def _test_token_ops(rank, world_size, device, group, ref_group):
+    from tokenspeed.runtime.distributed.comm_ops import (
+        token_all_gather,
+        token_reduce_scatter,
+    )
+
+    hidden_size = 256
+
+    # Even all_gather
+    tokens_per_rank = 64
+    scattered = [tokens_per_rank] * world_size
+    inp = torch.randn(tokens_per_rank, hidden_size, dtype=torch.bfloat16, device=device)
+    result = token_all_gather(inp, group, scattered_num_tokens=scattered)
+    assert result.shape[0] == tokens_per_rank * world_size
+
+    # Even reduce_scatter
+    total_tokens = tokens_per_rank * world_size
+    inp = torch.randn(total_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    result = token_reduce_scatter(inp, group, scattered_num_tokens=scattered)
+    assert result.shape[0] == tokens_per_rank
+
+    # Roundtrip: all_gather(reduce_scatter(x) / world_size) == x
+    tokens_per_rank = 32
+    total_tokens = tokens_per_rank * world_size
+    scattered = [tokens_per_rank] * world_size
+    torch.manual_seed(42)
+    full = torch.randn(total_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    scattered_out = token_reduce_scatter(full, group, scattered_num_tokens=scattered)
+    scattered_out = scattered_out / world_size
+    gathered = token_all_gather(scattered_out, group, scattered_num_tokens=scattered)
+    torch.testing.assert_close(gathered, full, atol=0.02, rtol=0.02)
+
+    # Uneven distribution
+    scattered = [1] * world_size
+    scattered[0] = 100
+    total_tokens = sum(scattered)
+    my_tokens = scattered[rank]
+    full = torch.randn(total_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    scattered_out = token_reduce_scatter(full, group, scattered_num_tokens=scattered)
+    assert scattered_out.shape[0] == my_tokens
+    gathered = token_all_gather(scattered_out, group, scattered_num_tokens=scattered)
+    assert gathered.shape[0] == total_tokens
+
+
+def _test_fused_ops(rank, world_size, device, group, ref_group):
+    from tokenspeed.runtime.distributed.comm_ops import (
+        FusionOp,
+        FusionParams,
+        fused_all_gather,
+        fused_all_reduce,
+        fused_reduce_scatter,
+    )
+
+    # fused_all_reduce with NONE
+    inp = torch.randint(1, 16, (1024,), dtype=torch.float32, device=device)
+    expected = inp.clone()
+    dist.all_reduce(expected, group=ref_group)
+    result = fused_all_reduce(inp.clone(), rank, group)
+    torch.testing.assert_close(result, expected)
+    result2 = fused_all_reduce(
+        inp.clone(), rank, group, fusion_params=FusionParams(fusion_op=FusionOp.NONE)
+    )
+    torch.testing.assert_close(result2, expected)
+
+    # fused_reduce_scatter with NONE
+    total_sz = 512 * world_size
+    inp = torch.randint(1, 16, (total_sz,), dtype=torch.float32, device=device)
+    expected = torch.empty(512, dtype=torch.float32, device=device)
+    dist.reduce_scatter_single(expected, inp, group=ref_group)
+    result = fused_reduce_scatter(inp.clone(), rank, group)
+    torch.testing.assert_close(result, expected)
+
+    # fused_all_gather with NONE
+    inp = torch.randint(1, 16, (256,), dtype=torch.float32, device=device)
+    output_list = [torch.empty_like(inp) for _ in range(world_size)]
+    dist.all_gather(output_list, inp, group=ref_group)
+    expected = torch.cat(output_list, dim=0)
+    result = fused_all_gather(inp, rank, group, dim=0)
+    torch.testing.assert_close(result, expected)
+
+
+def _test_backend_registry(rank, world_size, device, group, ref_group):
+    from tokenspeed.runtime.distributed.comm_backend import get_global_backend
+
+    backend = get_global_backend()
+    assert backend is not None
+
+    # Singleton
+    b2 = get_global_backend()
+    assert backend is b2
+
+    # Auto-create resources on first use
+    inp = torch.ones(4, device=device)
+    result = backend.all_reduce(inp, group)
+    assert result.shape == inp.shape
+
+
+# ---------------------------------------------------------------------------
+# FusionParams (no GPU needed)
+# ---------------------------------------------------------------------------
+
+
+class _RowGatherBackend:
+    """A fake backend whose all-gather is the low-latency solution's shape:
+    bf16 only, every rank's payload a whole number of 16-byte vectors."""
+
+    def __init__(self, world: int):
+        self.world = world
+        self.payloads: list[torch.Tensor] = []
+
+    def token_all_gather(self, tensor, group, scattered_num_tokens):
+        assert tensor.dtype == torch.bfloat16
+        assert tensor.numel() % 8 == 0, "payload is not 16-byte aligned"
+        self.payloads.append(tensor)
+        # Every rank holds the same bytes here; concatenate the counts' worth.
+        return torch.cat([tensor] * self.world)[: sum(scattered_num_tokens)]
+
+
+@pytest.mark.parametrize(
+    "dtype,width", [(torch.int64, 1), (torch.float32, 3), (torch.bfloat16, 5)]
+)
+def test_token_all_gather_rows_pads_narrow_rows_to_the_wire_alignment(dtype, width):
+    """A query shard gathers its token ids (one int64 per row) and fp32
+    scales; the row count is the shard's, so odd counts must still land
+    aligned, and the bytes come back as the caller's dtype, unpadded."""
+    from tokenspeed.runtime.distributed.comm_ops import token_all_gather_rows
+
+    local_rows = 5  # odd: 5 x 8 bytes is not a multiple of 16
+    rows = (torch.arange(local_rows * width) * 3).reshape(local_rows, width).to(dtype)
+    backend = _RowGatherBackend(world=2)
+    gathered = token_all_gather_rows(
+        rows, (0, 1), [local_rows, local_rows], backend=backend
+    )
+    assert gathered.dtype == dtype and gathered.shape == (2 * local_rows, width)
+    assert torch.equal(gathered[:local_rows], rows) and torch.equal(
+        gathered[local_rows:], rows
+    )
+    assert len(backend.payloads) == 1
+
+
+def test_token_all_gather_rows_leaves_aligned_bf16_rows_alone():
+    from tokenspeed.runtime.distributed.comm_ops import token_all_gather_rows
+
+    rows = torch.arange(3 * 8, dtype=torch.bfloat16).reshape(3, 8)  # 16-byte rows
+    backend = _RowGatherBackend(world=1)
+    gathered = token_all_gather_rows(rows, (0,), [3], backend=backend)
+    assert torch.equal(gathered, rows)
+    assert backend.payloads[0].data_ptr() == rows.data_ptr()
+
+
+class TestFusionParams:
+    def test_default_params(self):
+        from tokenspeed.runtime.distributed.comm_ops import FusionOp, FusionParams
+
+        params = FusionParams()
+        assert params.fusion_op == FusionOp.NONE
+        assert params.residual is None
+        assert params.norm_weight is None
+
+    def test_residual_rmsnorm_params(self):
+        from tokenspeed.runtime.distributed.comm_ops import FusionOp, FusionParams
+
+        weight = torch.ones(128)
+        residual = torch.zeros(4, 128)
+        params = FusionParams(
+            fusion_op=FusionOp.RESIDUAL_RMS_NORM,
+            norm_weight=weight,
+            residual=residual,
+            eps=1e-5,
+        )
+        assert params.fusion_op == FusionOp.RESIDUAL_RMS_NORM
+        assert params.norm_weight is weight
+
+    def test_prepare_all_reduce_lane_uses_backend_capability(self):
+        from tokenspeed.runtime.distributed.comm_ops import prepare_all_reduce_lane
+
+        calls = []
+
+        class Backend:
+            def prepare_all_reduce_lane(self, group, hidden_dim):
+                calls.append((group, hidden_dim))
+                return True
+
+        group = (0, 1)
+        assert prepare_all_reduce_lane(group, 10752, backend=Backend())
+        assert calls == [(group, 10752)]
+
+    def test_prepare_all_reduce_fusion_hides_kernel_backend(self, monkeypatch):
+        from tokenspeed.runtime.distributed import comm_ops
+
+        process_group = type("ProcessGroup", (), {"rank": lambda self: 3})()
+        calls = []
+        monkeypatch.setattr(
+            comm_ops,
+            "_get_process_group",
+            lambda group: process_group,
+        )
+        monkeypatch.setattr(
+            comm_ops,
+            "kernel_prepare_allreduce_fusion",
+            lambda **kwargs: calls.append(kwargs) or True,
+        )
+
+        assert comm_ops.prepare_all_reduce_fusion((0, 1), 10752, 8)
+        assert calls == [
+            {
+                "rank": 3,
+                "group": process_group,
+                "max_token_num": 8,
+                "hidden_dim": 10752,
+            }
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Multi-GPU test classes
+# ---------------------------------------------------------------------------
+
+WORLD_SIZES = [
+    pytest.param(2, id="ws2"),
+    pytest.param(4, id="ws4"),
+]
+
+
+class TestCommOps:
+    @pytest.mark.parametrize("world_size", WORLD_SIZES)
+    def test_all_reduce(self, world_size):
+        _run(world_size, _test_all_reduce)
+
+    @pytest.mark.parametrize("world_size", WORLD_SIZES)
+    def test_all_gather(self, world_size):
+        _run(world_size, _test_all_gather)
+
+    @pytest.mark.parametrize("world_size", WORLD_SIZES)
+    def test_all_gather_single(self, world_size):
+        _run(world_size, _test_all_gather_single)
+
+    @pytest.mark.parametrize(
+        "world_size,backend",
+        [
+            pytest.param(2, "runtime", id="ws2-runtime"),
+            pytest.param(4, "runtime", id="ws4-runtime"),
+            pytest.param(4, "cuda_lamport", id="ws4-cuda-lamport"),
+        ],
+    )
+    def test_all_to_all_single(self, world_size, backend):
+        if backend == "cuda_lamport":
+            if torch.version.hip is not None or torch.cuda.device_count() < world_size:
+                pytest.skip("Custom A2A requires four NVIDIA GPUs")
+            if importlib.util.find_spec("flashinfer") is None:
+                pytest.skip(
+                    "Custom A2A requires the optional FlashInfer JIT dependency"
+                )
+            if not all(
+                torch.cuda.can_device_access_peer(src, dst)
+                for src in range(world_size)
+                for dst in range(world_size)
+                if src != dst
+            ):
+                pytest.skip("Custom A2A requires full peer access")
+        _run(world_size, partial(_test_all_to_all_single, backend=backend))
+
+    @pytest.mark.parametrize("world_size", WORLD_SIZES)
+    def test_reduce_scatter(self, world_size):
+        _run(world_size, _test_reduce_scatter)
+
+    @pytest.mark.parametrize("world_size", WORLD_SIZES)
+    def test_token_ops(self, world_size):
+        _run(world_size, _test_token_ops)
+
+    @pytest.mark.parametrize("world_size", WORLD_SIZES)
+    def test_fused_ops(self, world_size):
+        _run(world_size, _test_fused_ops)
+
+    @pytest.mark.parametrize("world_size", WORLD_SIZES)
+    def test_backend_registry(self, world_size):
+        _run(world_size, _test_backend_registry)

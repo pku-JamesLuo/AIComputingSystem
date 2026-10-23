@@ -1,0 +1,727 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+import inspect
+from typing import TYPE_CHECKING
+
+import torch
+
+from tokenspeed.runtime.configs.numerics import require_verified_numerics
+from tokenspeed.runtime.execution.model_update import (
+    ModelUpdateAdapter,
+    model_update_adapter_for,
+)
+from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
+from tokenspeed.runtime.execution.weight_loader import WeightLoader
+from tokenspeed.runtime.execution.weight_update_group import (
+    _assert_not_split,
+    _no_default_group_split,
+)
+from tokenspeed.runtime.layers.linear import (
+    prepare_dp_linear_communication,
+    release_dp_linear_communication,
+)
+from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
+from tokenspeed.runtime.model_loader.weight_utils import (
+    non_unit_kv_scale_message,
+    record_non_unit_kv_scales,
+)
+from tokenspeed.runtime.models.base.weight_update import weight_update_session
+from tokenspeed.runtime.moe.expert_location import (
+    build_expert_placement,
+    get_global_expert_location_metadata,
+    set_global_expert_location_metadata,
+)
+from tokenspeed.runtime.moe.expert_location_updater import (
+    ExpertLocationUpdater,
+    build_expert_location_updater,
+)
+from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
+from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.env import global_server_args_dict_update
+from tokenspeed.runtime.utils.hf_transformers_utils import resolve_architecture
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.configs.model_config import ModelConfig
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.multimodal.inputs import MultimodalForwardContext
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+logger = get_colorful_logger(__name__)
+
+
+def infer_multimodal_encoder_dtype(model: torch.nn.Module) -> str | None:
+    """Return the dtype of the loaded multimodal encoder when discoverable."""
+    for path in (
+        ("visual",),
+        ("vision_tower",),
+        ("audio_tower",),
+        ("model", "visual"),
+        ("model", "vision_tower"),
+        ("model", "audio_tower"),
+    ):
+        component = model
+        for name in path:
+            component = getattr(component, name, None)
+            if component is None:
+                break
+        else:
+            dtype = getattr(component, "dtype", None)
+            if isinstance(dtype, torch.dtype):
+                return str(dtype).removeprefix("torch.")
+            if isinstance(component, torch.nn.Module):
+                for tensors in (component.parameters(), component.buffers()):
+                    for tensor in tensors:
+                        if tensor.is_floating_point():
+                            return str(tensor.dtype).removeprefix("torch.")
+    return None
+
+
+class ModelRunner:
+    def __init__(
+        self,
+        # Configuration
+        model_config: ModelConfig,
+        server_args: ServerArgs,
+        gpu_id: int,
+        global_rank: int,
+        *,
+        checkpoint_load_group: tuple[int, ...] | None,
+        is_draft_worker: bool = False,
+    ):
+        """Initialize ModelRunner with injected dependencies.
+
+        Args:
+            model_config: The model to build and load.
+            server_args: Parsed server arguments.
+            gpu_id: Local device index.
+            global_rank: This worker's global rank.
+            checkpoint_load_group: Global ranks that load this model together,
+                for a distributed loader's collectives; None means every rank.
+                A pipeline stage's draft names its stage, since the other
+                stages may not build it (``create_model_runner``).
+            is_draft_worker: Whether this is the speculative draft model.
+        """
+        # Store configuration
+        self.model_config = model_config
+        self.server_args = server_args
+        self.device = server_args.device
+        self.gpu_id = gpu_id
+        self.global_rank = global_rank
+        self.mapping = server_args.mapping
+        self.is_generation = model_config.is_generation
+        self.is_multimodal = model_config.is_multimodal
+        self.is_draft_worker = is_draft_worker
+        self.checkpoint_load_group = checkpoint_load_group
+        # Tensor shapes of the checkpoint the last disk reload read; until one
+        # succeeds, update_weights_from_disk reads them from model_path.
+        self._disk_reload_shapes: dict[str, tuple[int, ...]] | None = None
+        self._weight_update_pg: torch.distributed.ProcessGroup | None = None
+        self._weight_update_device: torch.device | None = None
+        # Model Updater SDK client for /update_weights_from_mooncake; None
+        # without --model-update-config and on the draft runner. Holds only
+        # the arguments until the first update imports the SDK (on the
+        # forward thread).
+        self.model_update: ModelUpdateAdapter | None = model_update_adapter_for(
+            server_args, global_rank=global_rank, is_draft_worker=is_draft_worker
+        )
+        # Set by load_model from the model's forward signature.
+        self._model_forward_accepts_spec_step_idx: bool = False
+        self.mambaish_config = getattr(model_config, "mambaish_config", None)
+        self.is_hybrid_gdn = getattr(model_config, "is_hybrid_gdn", False)
+        # Target and draft alike: the envelope covers every model that serves.
+        require_verified_numerics(
+            server_args.numerics,
+            model_profile=model_config.model_profile,
+            architecture=resolve_architecture(model_config.hf_config),
+            quantization=model_config.quantization,
+            vocab_size=model_config.vocab_size,
+        )
+
+        draft_moe_override = (
+            self.is_draft_worker
+            and server_args.draft_moe_backend is not None
+            and server_args.draft_moe_backend != server_args.moe_backend
+        )
+        if draft_moe_override:
+            saved_moe_backend = server_args.moe_backend
+            server_args.moe_backend = server_args.draft_moe_backend
+
+        # Auto-detect FP8 KV cache from checkpoint quant config (e.g. NVFP4 models
+        # with kv_cache_quant_algo: "FP8" in hf_quant_config.json).
+        if server_args.kv_cache_dtype == "auto":
+            quant_cfg = model_config._parse_quant_hf_config()
+            if quant_cfg is not None:
+                kv_algo = quant_cfg.get("kv_cache_quant_algo")
+                if isinstance(kv_algo, str) and kv_algo.upper() == "FP8":
+                    server_args.kv_cache_dtype = "fp8_e4m3"
+                    logger.info(
+                        "Auto-detected kv_cache_dtype=fp8_e4m3 from checkpoint "
+                        f"quant config (kv_cache_quant_algo={kv_algo!s})",
+                    )
+
+        global_server_args_dict_update(server_args)
+        initialize_moe_config(server_args)
+
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver
+        )
+        # The target's expert placement (redundant replicas, load counters) is
+        # process-global so its model picks it up while it is built and loaded.
+        # A draft routes its own experts trivially: the target's placement is
+        # hidden while the draft is built, then restored for serving.
+        # Online rebalancing (--enable-eplb) moves the target's expert weights
+        # between slots: its staging buffer and P2P channels are reserved here,
+        # after the load and before the cache profile sizes the KV arena.
+        self.expert_location_updater: ExpertLocationUpdater | None = None
+        if self.is_draft_worker:
+            target_placement = get_global_expert_location_metadata()
+            set_global_expert_location_metadata(None)
+            try:
+                self.load_model()
+            finally:
+                set_global_expert_location_metadata(target_placement)
+        else:
+            set_global_expert_location_metadata(
+                build_expert_placement(server_args, model_config)
+            )
+            self.load_model()
+            if server_args.enable_eplb:
+                self.expert_location_updater = build_expert_location_updater(
+                    self.model, model_config, server_args
+                )
+        if draft_moe_override:
+            server_args.moe_backend = saved_moe_backend
+            global_server_args_dict_update(server_args)
+            initialize_moe_config(server_args)
+
+    def load_model(self):
+        self.model = WeightLoader.load_model(
+            model_config=self.model_config,
+            server_args=self.server_args,
+            device=self.device,
+            gpu_id=self.gpu_id,
+            memory_saver_adapter=self.memory_saver_adapter,
+            checkpoint_load_group=self.checkpoint_load_group,
+        )
+        self._model_forward_accepts_spec_step_idx = self._forward_accepts_kwarg(
+            self.model, "spec_step_idx"
+        )
+
+    @property
+    def forward_accepts_spec_step_idx(self) -> bool:
+        """Whether the model's ``forward`` declares ``spec_step_idx``.
+
+        :meth:`forward` passes ``spec_step_idx`` through only when this holds
+        (``**kwargs`` alone does not count); a drafter that selects depth by
+        step must check it at construction rather than discover at serve time
+        that every step ran depth 0.
+        """
+        return self._model_forward_accepts_spec_step_idx
+
+    @property
+    def multimodal_encoder_dtype(self) -> str | None:
+        return infer_multimodal_encoder_dtype(self.model)
+
+    def prepare_multimodal_runtime(self) -> None:
+        """Prepare loaded multimodal encoders for serving.
+
+        This is an explicit post-load phase because it can execute substantial
+        GPU work. Language workers must call it before KV-cache memory
+        profiling so retained encoder graph pools and lazy buffers are included
+        in the cache budget. Encoder-only EPD workers call the same phase even
+        though they do not allocate a KV cache.
+        """
+        self.encoder_graph_wrappers = MultimodalRuntime.install_encoder_graphs(
+            self.model, self.server_args
+        )
+        if self.encoder_graph_wrappers:
+            logger.info(
+                "Multimodal encoder CUDA graphs installed for "
+                f"{sorted(self.encoder_graph_wrappers)!s}",
+            )
+
+        warmup_device = torch.device(self.device)
+        if warmup_device.type == "cuda" and warmup_device.index is None:
+            warmup_device = torch.device("cuda", self.gpu_id)
+        warmup_multimodal_encoders(
+            self.model,
+            device=warmup_device,
+        )
+
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        """Allocate model communication buffers before cache planning.
+
+        The expert load counters' live-row mask is reserved here too: it is
+        sized by the largest MoE input a forward can carry (the MoE TP-EP
+        group's all-gather of ``max_num_tokens`` rows per rank), must exist
+        before the first forward (captured graphs hold its address) and is
+        accounted for by the cache profile like the communication buffers.
+        """
+        placement = get_global_expert_location_metadata()
+        if (
+            not self.is_draft_worker
+            and placement is not None
+            and placement.load_rows is not None
+        ):
+            placement.reserve_load_rows(
+                self.server_args.mapping.moe.tp_ep_size * max_num_tokens
+            )
+        prepared = prepare_dp_linear_communication(
+            self.model, max_num_tokens, self.model_config.dtype, backend=None
+        )
+        prepare = getattr(self.model, "prepare_communication_runtime", None)
+        if prepare is None:
+            return prepared
+        return bool(prepare(max_num_tokens)) or prepared
+
+    def release_dp_linear_communication(self) -> None:
+        """Collectively release this model's DP projection communication only.
+
+        Drain forwards and destroy referencing graphs first; keep process groups
+        alive until release finishes on every peer. Cache re-capture retains
+        these resources, so graph release alone must not call this method.
+        """
+        release_dp_linear_communication(self.model)
+
+    @staticmethod
+    def _forward_accepts_kwarg(model, name: str) -> bool:
+        try:
+            parameters = inspect.signature(model.forward).parameters
+        except (TypeError, ValueError):
+            return False
+
+        return name in parameters
+
+    def forward(
+        self,
+        ctx: ForwardContext,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        captured_hidden_states: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
+        multimodal_context: MultimodalForwardContext | None = None,
+        spec_step_idx: int | None = None,
+        kv_sync_event: "torch.cuda.Event | None" = None,
+        pp_inbound=None,
+        **kwargs,
+    ) -> LogitsProcessorOutput:
+        if pp_inbound is not None:
+            kwargs["pp_inbound"] = pp_inbound
+        if not self.is_generation:
+            kwargs["get_embedding"] = True
+        if captured_hidden_states is not None:
+            kwargs["captured_hidden_states"] = captured_hidden_states
+        if input_embeds is not None:
+            kwargs["input_embeds"] = input_embeds
+        if multimodal_context is not None:
+            kwargs["multimodal_context"] = multimodal_context
+        if spec_step_idx is not None and self.forward_accepts_spec_step_idx:
+            kwargs["spec_step_idx"] = spec_step_idx
+        if kv_sync_event is not None:
+            kwargs["kv_sync_event"] = kv_sync_event
+
+        return self.model.forward(
+            ctx,
+            input_ids,
+            positions,
+            **kwargs,
+        )
+
+    # ------------------------------------------------------------------ #
+    # RL online weight sync: receive NCCL-broadcast weights from a trainer.
+    #
+    # Mirrors the slime/SGLang sender contract: the trainer occupies ranks
+    # ``0..rank_offset-1`` and each inference worker joins at
+    # ``rank_offset + global_rank``. The trainer broadcasts each named weight
+    # from rank 0 (in ``names`` order); this worker receives in the same order
+    # and applies via the model's ``load_weights`` (the same name->param mapping,
+    # including fused/stacked params, used by the initial load).
+    # ------------------------------------------------------------------ #
+
+    def init_weights_update_group(self, obj) -> tuple[bool, str]:
+        """Join the trainer's ``torch.distributed`` NCCL weight-update group.
+
+        The trainer (slime/sglang dialect) creates the peer group with
+        ``init_process_group(init_method="tcp://addr:port", rank=0, world_size)``
+        and pushes weights via ``dist.broadcast(..., src=0)``. We must rendezvous
+        through the *same* torch TCP-store + NCCL-unique-id handshake — a
+        ``StatelessProcessGroup``/``PyNcclCommunicator`` keys its store
+        differently and never forms a joint communicator with a torch group, so
+        the broadcast would deadlock. Build a standalone, non-default group (via
+        the same private helper torch's own ``init_process_group`` uses) so it
+        never collides with the engine's own world. Because that world group is
+        created with a bound device, we also have to guard the new group
+        against torch silently splitting it off the engine's own communicator
+        instead of rendezvousing with the trainer.
+        """
+        from packaging.version import parse as _parse_version
+        from torch.distributed.distributed_c10d import (
+            Backend,
+            PrefixStore,
+            _new_process_group_helper,
+            _world,
+            default_pg_timeout,
+            rendezvous,
+        )
+
+        try:
+            rank = int(obj.rank_offset) + self.global_rank
+            world_size = int(obj.world_size)
+            group_name = str(getattr(obj, "group_name", "weight_update_group"))
+            backend = Backend(str(getattr(obj, "backend", "nccl")))
+            device = torch.device(f"cuda:{self.gpu_id}")
+            torch.cuda.set_device(device)
+
+            timeout = default_pg_timeout
+            init_method = f"tcp://{obj.master_address}:{int(obj.master_port)}"
+            store, rank, world_size = next(
+                rendezvous(init_method, rank, world_size, timeout=timeout)
+            )
+            store.set_timeout(timeout)
+            store = PrefixStore(group_name, store)
+            opt = (
+                "backend_options"
+                if _parse_version(torch.__version__) >= _parse_version("2.6")
+                else "pg_options"
+            )
+            with _no_default_group_split():
+                pg, _ = _new_process_group_helper(
+                    world_size,
+                    rank,
+                    [],
+                    backend,
+                    store,
+                    group_name=group_name,
+                    **{opt: None},
+                    timeout=timeout,
+                )
+            _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
+            try:
+                _assert_not_split(pg, device)
+            except RuntimeError:
+                torch.distributed.destroy_process_group(pg)
+                raise
+
+            self._weight_update_pg = pg
+            self._weight_update_device = device
+            logger.info(
+                f"weight-update group joined: rank={rank:d} world_size={world_size:d} "
+                f"device={device!s} group={group_name!s}",
+            )
+            return True, "weight update group initialized"
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("init_weights_update_group failed")
+            return False, str(e)
+
+    def update_weights_from_distributed(self, obj) -> tuple[bool, str]:
+        """Receive trainer-broadcast weights over the NCCL group and load them."""
+        import torch.distributed as dist
+
+        pg = self._weight_update_pg
+        if pg is None:
+            return False, "weight update group not initialized"
+        try:
+            names = list(obj.names)
+            dtype_names = list(obj.dtype_names)
+            shapes = [tuple(s) for s in obj.shapes]
+            device = self._weight_update_device
+
+            def _recv():
+                # NCCL broadcasts are ordered collectives: receive each weight in
+                # the trainer's send order (rank 0 is the trainer) and hand it to
+                # the model's loader (the same name->param mapping, including
+                # fused/stacked params, used by the initial load).
+                for name, dtype_name, shape in zip(names, dtype_names, shapes):
+                    buf = torch.empty(
+                        shape, dtype=getattr(torch, dtype_name), device=device
+                    )
+                    dist.broadcast(buf, src=0, group=pg)
+                    yield name, buf
+
+            # The update loads to completion so the model stays consistent,
+            # then fails on a scale. A BaseCausalLM session screens the stream
+            # itself and raises at its end; this wrap covers the models that
+            # take no session (multimodal wrappers).
+            rejected: list[str] = []
+            with weight_update_session([self.model]):
+                self.model.load_weights(record_non_unit_kv_scales(_recv(), rejected))
+            torch.cuda.synchronize(device)
+            if rejected:
+                return False, (
+                    f"applied {len(names)} weights, but the update is rejected and "
+                    f"its weight version not advanced: {non_unit_kv_scale_message(rejected)}; "
+                    "resend the weights without KV-cache scales"
+                )
+            return True, f"updated {len(names)} weights"
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("update_weights_from_distributed failed")
+            return False, str(e)
+
+    def update_weights_from_mooncake(
+        self, version: int, models: list[torch.nn.Module]
+    ) -> tuple[bool, str]:
+        """Read one committed weight-store version into ``models`` in place.
+
+        Runs on the forward thread. The SDK streams partial ``load_weights``
+        calls, so the models are bracketed in a weight-update session; the
+        SDK's device staging buffers are released afterwards -- also when the
+        read failed partway -- because PyTorch would otherwise keep the blocks
+        cached against the KV arena.
+
+        Args:
+            version: The committed version to load.
+            models: Target first, then the draft when the server's
+                ``--model-update-draft-weights`` is ``refresh``.
+
+        Returns:
+            ``(ok, message)`` for the control plane.
+        """
+        if self.model_update is None:
+            return False, (
+                "update_weights_from_mooncake requires the server to start with "
+                "--model-update-config (target runner only)"
+            )
+        try:
+            with weight_update_session(models):
+                result = self.model_update.update(models, version)
+            torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
+            return True, f"applied model version {version}: {result}"
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("update_weights_from_mooncake failed")
+            return False, str(e)
+        finally:
+            torch.cuda.empty_cache()
+
+    def update_weights_from_disk(self, obj) -> tuple[bool, str]:
+        """Reload this worker's parameters in place from a checkpoint directory.
+
+        The checkpoint is streamed the way the startup loader streams it
+        (``DefaultModelLoader.get_checkpoint_weights``) into the model's own
+        ``load_weights``, so fused and stacked parameters map, the checkpoint
+        directory is bound and the load group is chosen as on the initial
+        load. The reported count comes from the tensors the loader actually
+        yielded, not from the request: a checkpoint that yields nothing is a
+        failure, not a success that updated nothing.
+
+        Refusals write nothing: a model whose weights the startup loader
+        transformed after loading (``post_load_transformed_modules``) cannot
+        take checkpoint tensors at all, and a safetensors checkpoint with an
+        unreadable shard or a tensor shaped differently from the checkpoint
+        the model holds would fail partway through the load. A failure after
+        tensors have reached the model says the weights may be partial.
+        """
+        from tokenspeed.runtime.configs.load_config import LoadConfig
+        from tokenspeed.runtime.model_loader.loader import (
+            DefaultModelLoader,
+            get_model_loader,
+            post_load_transformed_modules,
+        )
+
+        model_path = str(obj.model_path)
+        transformed = post_load_transformed_modules(self.model)
+        if transformed:
+            more = len(transformed) - 3
+            return False, (
+                "update_weights_from_disk cannot reload this model in place: the "
+                "startup loader transformed its weights after loading ("
+                + ", ".join(transformed[:3])
+                + (f", and {more} more" if more > 0 else "")
+                + "), and a checkpoint holds them untransformed. Nothing was "
+                f"written; restart the engine with {model_path!r} instead"
+            )
+        load_format = obj.load_format or self.server_args.load_format
+        consumed = 0
+        try:
+            loader = get_model_loader(
+                LoadConfig(
+                    load_format=load_format,
+                    download_dir=self.server_args.download_dir,
+                    ext_yaml=self.server_args.ext_yaml,
+                    weight_loader_prefetch_checkpoints=(
+                        self.server_args.weight_loader_prefetch_checkpoints
+                    ),
+                    weight_loader_prefetch_num_threads=(
+                        self.server_args.weight_loader_prefetch_num_threads
+                    ),
+                    checkpoint_load_group=self.checkpoint_load_group,
+                )
+            )
+            if not isinstance(loader, DefaultModelLoader):
+                return False, (
+                    f"load_format {load_format!r} selects "
+                    f"{type(loader).__name__}, which does not read checkpoint "
+                    "files; an in-place reload needs a file-backed format"
+                )
+
+            shapes, problem = self._check_disk_reload(loader, model_path)
+            if problem is not None:
+                return False, f"{problem}; nothing was written"
+            weights = loader.get_checkpoint_weights(
+                model_path, None, self.model, self.model_config.mapping
+            )
+
+            def _counted():
+                nonlocal consumed
+                for name, tensor in weights:
+                    consumed += 1
+                    yield name, tensor
+
+            # Same session and KV-cache scale screen as a distributed load.
+            rejected: list[str] = []
+            with weight_update_session([self.model]):
+                self.model.load_weights(
+                    record_non_unit_kv_scales(
+                        _counted(),
+                        rejected,
+                    )
+                )
+            if consumed == 0:
+                return False, (
+                    f"no checkpoint tensors found at {model_path!r}; "
+                    "nothing was updated"
+                )
+            if rejected:
+                return False, (
+                    f"{non_unit_kv_scale_message(rejected)}; a weight update keeps "
+                    f"the KV-cache scales loaded at startup ({consumed} checkpoint "
+                    "tensors had reached the model)"
+                )
+            if self.device != "cpu":
+                torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("update_weights_from_disk failed")
+            if consumed == 0:
+                return False, str(e)
+            return False, (
+                f"{e} (after {consumed} checkpoint tensors had reached the "
+                "model, so its weights may now mix the old and new "
+                "checkpoints: reload a complete checkpoint or restart the "
+                "engine)"
+            )
+
+        self.model_config.model_path = model_path
+        if shapes is not None:
+            self._disk_reload_shapes = shapes
+        logger.info(f"weights reloaded from {model_path!s} ({consumed:d} tensors)")
+        return True, (
+            f"Succeeded to update model weights from {model_path} "
+            f"({consumed} checkpoint tensors read)"
+        )
+
+    def _check_disk_reload(
+        self, loader, model_path: str
+    ) -> tuple[dict[str, tuple[int, ...]] | None, str | None]:
+        """Check a safetensors checkpoint's headers before any tensor is loaded.
+
+        Both checks read headers only. A shard that will not parse or is
+        shorter than its header declares, or a tensor whose shape differs from
+        the same name in the checkpoint this model holds, would fail the load
+        partway, after the tensors before it were written. Names the two
+        checkpoints do not share are left to ``load_weights``, which alone
+        knows how it maps them.
+
+        Returns:
+            ``(shapes, problem)``: the checkpoint's tensor shapes (None when
+            it is not safetensors) and why it must be refused (None if not).
+        """
+        from tokenspeed.runtime.model_loader.weight_utils import (
+            safetensors_tensor_shapes,
+        )
+
+        fall_back_to_pt = getattr(self.model, "fall_back_to_pt_during_load", False)
+        _, files, use_safetensors = loader._prepare_weights(
+            model_path, None, fall_back_to_pt
+        )
+        if not use_safetensors:
+            return None, None
+        try:
+            shapes = safetensors_tensor_shapes(files)
+        except ValueError as e:
+            return None, str(e)
+
+        held = self._disk_reload_shapes
+        if held is None:
+            try:
+                _, held_files, held_safetensors = loader._prepare_weights(
+                    self.model_config.model_path,
+                    getattr(self.model_config, "revision", None),
+                    fall_back_to_pt,
+                )
+                held = safetensors_tensor_shapes(held_files) if held_safetensors else {}
+            except Exception as e:  # noqa: BLE001 - only the shape check is lost
+                logger.warning(
+                    "update_weights_from_disk: cannot read the shapes of "
+                    f"{self.model_config.model_path!s} ({e!s}); "
+                    "checking the new checkpoint's shards only"
+                )
+                held = {}
+        # The default loader fills a one-element parameter from any
+        # one-element tensor, so those match whatever their shapes.
+        mismatched = [
+            (name, shape, held[name])
+            for name, shape in shapes.items()
+            if name in held
+            and shape != held[name]
+            and not (torch.Size(shape).numel() == 1 == torch.Size(held[name]).numel())
+        ]
+        if mismatched:
+            name, shape, expected = mismatched[0]
+            more = len(mismatched) - 1
+            return shapes, (
+                f"{model_path}: tensor {name!r} has shape {list(shape)}, but "
+                f"{list(expected)} in the checkpoint the model holds"
+                + (f" ({more} more mismatched)" if more else "")
+            )
+        return shapes, None
+
+    def destroy_weights_update_group(self, obj) -> tuple[bool, str]:
+        """Tear down the trainer weight-update NCCL group joined in ``init``.
+
+        When a training run ends the trainer drops its end of the group, so the
+        worker must release its side too -- free the NCCL communicator and the
+        torch ``_world`` bookkeeping ``init_weights_update_group`` registered --
+        instead of leaking it until engine shutdown. A fresh run then re-inits a
+        clean group. Idempotent: tearing down when no group is live is a success
+        so a trainer that always calls destroy (e.g. slime) never errors.
+        """
+        pg = self._weight_update_pg
+        if pg is None:
+            return True, "weight update group not initialized"
+
+        import torch.distributed as dist
+        from torch.distributed.distributed_c10d import _world
+
+        try:
+            dist.destroy_process_group(pg)
+            # init() registered this group's rank map via the low-level helper;
+            # drop it explicitly in case destroy_process_group left it behind.
+            _world.pg_group_ranks.pop(pg, None)
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("destroy_weights_update_group failed")
+            return False, str(e)
+        self._weight_update_pg = None
+        self._weight_update_device = None
+        logger.info("weight-update group destroyed")
+        return True, "weight update group destroyed"

@@ -1,0 +1,75 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-gpt-oss-120b-mxfp4-gpqa-diamond
+type: eval
+workflow_stage: model-test
+# AMD MI35x has hit GPU memory-access faults at eval-batch-size 64; NVIDIA
+# keeps 64. One extra server+eval attempt covers remaining infra crashes.
+retries: 1
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - b200-2gpu
+    - amd-mi35x-2gpu-test
+  env:
+    b200-2gpu:
+      GPT_OSS_EVAL_MODEL: openai/gpt-oss-120b
+      GPT_OSS_EVAL_BATCH_SIZE: "64"
+    amd-mi35x-2gpu-test:
+      GPT_OSS_EVAL_MODEL: amd/gpt-oss-120b-w-mxfp4-a-fp8
+      GPT_OSS_EVAL_BATCH_SIZE: "16"
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    ts serve
+    --model ${GPT_OSS_EVAL_MODEL}
+    --attn-tp-size 2
+    --moe-tp-size 2
+    --max-model-len 80000
+    --trust-remote-code
+    --reasoning-parser base
+    --disable-kvstore
+    --host 127.0.0.1
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  # Expected GPQA-Diamond AveragePass@1 bar: 0.74 +- 0.03 (gpt-oss-120b reasoning).
+  # --repeats 3 samples each of the 198 questions 3x and averages, shrinking the
+  # per-run stddev by ~sqrt(3). At the 0.7 threshold this drops the noise-only
+  # failure rate from ~11% to ~2%.
+  # NVIDIA keeps --eval-batch-size 64. AMD MI35x uses 16: batch=64 has hit
+  # GPU memory-access faults on the first large prefill. NVIDIA still has
+  # 2.5x headroom vs max_num_seqs=160; AMD trades some idle decode capacity
+  # for stability. Higher NVIDIA concurrency also lets the prefix cache hit
+  # on --repeats duplicates.
+  command: >-
+    if [ "${TOKENSPEED_CI_FORK_PR:-false}" = "true" ];
+    then GPQA_DATASET_HUB=modelscope;
+    GPQA_DATASET_ARGS='{"gpqa_diamond":{"dataset_id":"AI-ModelScope/gpqa_diamond"}}';
+    else GPQA_DATASET_HUB=huggingface;
+    GPQA_DATASET_ARGS='{"gpqa_diamond":{"dataset_id":"Idavidrein/gpqa","subset_list":["gpqa_diamond"]}}';
+    fi;
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model ${GPT_OSS_EVAL_MODEL}
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets gpqa_diamond
+    --dataset-hub "$GPQA_DATASET_HUB"
+    --dataset-args "$GPQA_DATASET_ARGS"
+    --eval-batch-size ${GPT_OSS_EVAL_BATCH_SIZE:-64}
+    --repeats 3
+report:
+  github_step_summary: true
+# GPQA-Diamond remains flaky near 0.70 even with repeated sampling; keep a
+# slightly lower floor so noise-only CI variance does not fail the task.
+score_threshold: 0.69

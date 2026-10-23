@@ -1,0 +1,60 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-glm-5.2-nvfp4-mtp-aime26
+type: eval
+workflow_stage: model-test
+triggers:
+  - manual
+runner:
+  labels:
+    - b200-4gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    ts serve
+    --disable-kvstore
+    --model nvidia/GLM-5.2-NVFP4
+    --attn-tp-size 4
+    --ep-size 4
+    --max-model-len 262144
+    --max-num-seqs 16
+    --max-prefill-tokens 8192
+    --chunked-prefill-size 8192
+    --disable-cuda-graph-padding
+    --trust-remote-code
+    --moe-backend flashinfer_trtllm
+    --quantization nvfp4
+    --kv-cache-dtype fp8
+    --speculative-algorithm MTP
+    --speculative-num-steps 3
+    --speculative-eagle-topk 1
+    --speculative-num-draft-tokens 4
+    --speculative-draft-model-quantization unquant
+    --host 127.0.0.1
+    --port 8000
+    --grammar-backend xgrammar
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --work-dir .ci-artifacts/published/evalscope-results
+    --model nvidia/GLM-5.2-NVFP4
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets aime26
+    --dataset-hub huggingface
+    --dataset-args '{"aime26":{"dataset_id":"math-ai/aime26"}}'
+    --eval-batch-size 16
+    --stream
+    --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"max_tokens":163840}'
+report:
+  github_step_summary: true
+score_threshold: 0.86

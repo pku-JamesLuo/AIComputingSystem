@@ -1,0 +1,357 @@
+from __future__ import annotations
+
+import runpy
+import shutil
+import subprocess
+import tarfile
+from collections import Counter
+from pathlib import Path
+
+import pytest
+import setuptools
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+from setuptools import build_meta
+
+SETUP_PY = Path(__file__).parents[1] / "python" / "setup.py"
+REQUIREMENTS_DIR = SETUP_PY.parent / "requirements"
+
+
+def _capture_setup_kwargs(monkeypatch, backend: str) -> dict:
+    setup_kwargs = {}
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", backend)
+    monkeypatch.setattr(
+        setuptools, "setup", lambda **kwargs: setup_kwargs.update(kwargs)
+    )
+    runpy.run_path(str(SETUP_PY))
+    return setup_kwargs
+
+
+def _capture_install_requires(monkeypatch, backend: str) -> list[str]:
+    return _capture_setup_kwargs(monkeypatch, backend)["install_requires"]
+
+
+def _direct_requirements(path: Path) -> list[str]:
+    requirements = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith("-"):
+            continue
+        requirements.append(line)
+    return requirements
+
+
+def _expected_install_requires(backend: str) -> list[str]:
+    requirements = _direct_requirements(REQUIREMENTS_DIR / f"{backend}.txt")
+    requirements.extend(
+        _direct_requirements(REQUIREMENTS_DIR / f"{backend}-thirdparty.txt")
+    )
+    return list(dict.fromkeys(requirements))
+
+
+def _requirements_by_name(requirements: list[str]) -> dict[str, Requirement]:
+    assert all(not requirement.startswith("-") for requirement in requirements)
+    parsed = [Requirement(requirement) for requirement in requirements]
+    names = [canonicalize_name(requirement.name) for requirement in parsed]
+    duplicates = sorted(name for name, count in Counter(names).items() if count > 1)
+    assert not duplicates, f"duplicate dependency names: {duplicates}"
+    return dict(zip(names, parsed, strict=True))
+
+
+def test_nightly_version_uses_post_date(monkeypatch) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "false")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "release/test")
+    base_version = _capture_setup_kwargs(monkeypatch, "cuda")["version"]
+
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "true")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20260929")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "main")
+    assert _capture_setup_kwargs(monkeypatch, "cuda")["version"] == (
+        f"{base_version}.post20260929"
+    )
+
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20260230")
+    with pytest.raises(ValueError):
+        _capture_setup_kwargs(monkeypatch, "cuda")
+
+
+def test_cuda_install_requires_include_runtime_dependencies(monkeypatch) -> None:
+    install_requires = _capture_install_requires(monkeypatch, "cuda")
+
+    assert install_requires == _expected_install_requires("cuda")
+    requirements = _requirements_by_name(install_requires)
+    assert {
+        "tokenspeed-proton",
+        "tokenspeed-triton",
+        "flashinfer-python",
+        "nvidia-cudnn-frontend",
+        "nvidia-ml-py",
+        "nvtx",
+        "torch",
+        "tokenspeed-deepgemm",
+    } <= requirements.keys()
+    assert {"tokenspeed-kernel-amd", "tokenspeed-iris"}.isdisjoint(requirements)
+    assert "tokenspeed-triton-kernels" not in requirements
+    assert requirements["nvidia-cutlass-dsl"].extras == {"cu13"}
+    assert str(requirements["nvidia-cudnn-frontend"].specifier) == "==1.31.0"
+
+
+def test_cuda_thirdparty_requirements_are_exactly_pinned() -> None:
+    requirements = _requirements_by_name(
+        _direct_requirements(REQUIREMENTS_DIR / "cuda-thirdparty.txt")
+    )
+
+    not_exactly_pinned = sorted(
+        name
+        for name, requirement in requirements.items()
+        if {specifier.operator for specifier in requirement.specifier} != {"=="}
+    )
+    assert (
+        not not_exactly_pinned
+    ), f"CUDA third-party requirements must use ==: {not_exactly_pinned}"
+
+
+def test_rocm_install_requires_exclude_cuda_dependencies(monkeypatch) -> None:
+    install_requires = _capture_install_requires(monkeypatch, "rocm")
+
+    assert install_requires == _expected_install_requires("rocm")
+    requirements = _requirements_by_name(install_requires)
+    assert {
+        "tokenspeed-proton",
+        "tokenspeed-triton",
+        "tokenspeed-kernel-amd",
+        "tokenspeed-iris",
+        "triton",
+        "torch",
+    } <= requirements.keys()
+    assert str(requirements["triton"].specifier) == "==3.8.0"
+    assert {
+        specifier.operator
+        for specifier in requirements["tokenspeed-kernel-amd"].specifier
+    } == {">="}
+    assert {
+        "flashinfer-python",
+        "nvidia-cutlass-dsl",
+        "nvidia-cutlass-dsl-libs-cu13",
+        "nvidia-ml-py",
+        "nvtx",
+        "tokenspeed-deepep",
+        "tokenspeed-deepgemm",
+        "tokenspeed-fa3",
+        "tokenspeed-fa4",
+        "tokenspeed-fast-hadamard-transform",
+        "tokenspeed-flashmla",
+        "tokenspeed-mla",
+        "tokenspeed-trtllm-kernel",
+        "tokenspeed-triton-kernels",
+    }.isdisjoint(requirements)
+
+
+def test_npu_install_requires_use_ascend_provider(monkeypatch) -> None:
+    install_requires = _capture_install_requires(monkeypatch, "npu")
+    assert install_requires == _expected_install_requires("npu")
+    requirements = _requirements_by_name(install_requires)
+    assert {"torch", "triton-ascend", "apache-tvm-ffi"} <= requirements.keys()
+    assert str(requirements["triton-ascend"].specifier) == "==3.2.1"
+    assert not any(
+        name.startswith("nvidia-")
+        or name
+        in {"tokenspeed-triton", "tokenspeed-proton", "flashinfer-python", "triton"}
+        for name in requirements
+    )
+    kwargs = _capture_setup_kwargs(monkeypatch, "npu")
+    from setuptools import Distribution
+
+    command = kwargs["cmdclass"]["build_ext"](Distribution())
+    monkeypatch.setattr(
+        subprocess,
+        "check_call",
+        lambda *args, **kwargs: pytest.fail("unexpected build"),
+    )
+    command.run()
+
+
+def test_gluon_petit_runtime_assets_are_packaged(monkeypatch) -> None:
+    monkeypatch.chdir(SETUP_PY.parent)
+    setup_kwargs = _capture_setup_kwargs(monkeypatch, "rocm")
+
+    assert {
+        "tokenspeed_kernel.thirdparty.gluon_petit",
+        "tokenspeed_kernel.thirdparty.gluon_petit.lib.moe.rocm.mega_moe",
+        "tokenspeed_kernel.thirdparty.gluon_petit.lib.pybind",
+        "tokenspeed_kernel.thirdparty.gluon_petit.petit_kernel",
+    } <= set(setup_kwargs["packages"])
+    assert setup_kwargs["package_data"]["tokenspeed_kernel.thirdparty.gluon_petit"] == [
+        "LICENSE.txt",
+        "README.md",
+        "lib/pybind/*.cc",
+        "lib/pybind/*.h",
+    ]
+
+
+def test_read_requirements_skips_installer_options_and_cycles(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    setup_namespace = runpy.run_path(str(SETUP_PY))
+
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text(
+        "-rsecond.txt\n--extra-index-url https://example.invalid/simple\n"
+        "first-package==1\n",
+        encoding="utf-8",
+    )
+    second.write_text(
+        "--requirement=first.txt\n--find-links https://example.invalid/wheels\n"
+        "second-package>=2\n",
+        encoding="utf-8",
+    )
+
+    assert setup_namespace["_read_requirements"](first) == [
+        "second-package>=2",
+        "first-package==1",
+    ]
+
+
+@pytest.mark.parametrize("backend", ["cuda", "rocm"])
+def test_sdist_includes_requirements_and_python_sources(
+    tmp_path, monkeypatch, backend
+) -> None:
+    source = tmp_path / "python"
+    dist_dir = tmp_path / "dist"
+    shutil.copytree(SETUP_PY.parent, source)
+    dist_dir.mkdir()
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", backend)
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_SHA", "test")
+    monkeypatch.chdir(source)
+
+    archive_name = build_meta.build_sdist(str(dist_dir))
+
+    with tarfile.open(dist_dir / archive_name) as archive:
+        archived_files = {
+            name.split("/", maxsplit=1)[1] for name in archive.getnames() if "/" in name
+        }
+    expected_files = {
+        f"requirements/{path.name}" for path in REQUIREMENTS_DIR.glob("*.txt")
+    }
+    expected_files.update(
+        path.relative_to(source).as_posix()
+        for path in (source / "tokenspeed_kernel").rglob("*.py")
+    )
+    expected_files.update(
+        {
+            "tokenspeed_kernel/thirdparty/gluon_petit/LICENSE.txt",
+            "tokenspeed_kernel/thirdparty/gluon_petit/README.md",
+            "tokenspeed_kernel/thirdparty/gluon_petit/lib/pybind/bindings.cc",
+            "tokenspeed_kernel/thirdparty/gluon_petit/lib/pybind/pybind.h",
+            "tokenspeed_kernel/thirdparty/gluon_petit/lib/pybind/vmm_symmetric_heap.cc",
+            "tokenspeed_kernel/thirdparty/gluon_petit/lib/moe/rocm/mega_moe/"
+            "mega_moe_two_stage_kernel.py",
+            "tokenspeed_kernel/thirdparty/gluon_petit/petit_kernel/__init__.py",
+        }
+    )
+    assert expected_files <= archived_files
+
+
+def test_cuda_include_dirs_prefer_complete_toolkit_headers(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    setup_namespace = runpy.run_path(str(SETUP_PY))
+
+    cuda_root = tmp_path / "cuda"
+    cuda_include = cuda_root / "include"
+    cuda_include.mkdir(parents=True)
+    (cuda_include / "cuda_runtime.h").touch()
+    (cuda_include / "cublas_v2.h").touch()
+
+    site_packages = tmp_path / "site-packages"
+    wheel_include = site_packages / "nvidia" / "cu13" / "include"
+    wheel_include.mkdir(parents=True)
+    (wheel_include / "cuda_runtime.h").touch()
+    (wheel_include / "cublas_v2.h").touch()
+
+    builder = setup_namespace["CudaKernelBuilder"]([], verbose=False)
+    monkeypatch.setattr(builder, "_cuda_toolkit_roots", lambda: iter([cuda_root]))
+    monkeypatch.setattr(builder, "_site_paths", lambda: iter([site_packages]))
+
+    include_dirs = builder._resolve_include_dirs()
+
+    assert str(cuda_include) in include_dirs
+    assert str(wheel_include) not in include_dirs
+
+
+def test_cuda_include_dirs_fall_back_from_partial_toolkit(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    setup_namespace = runpy.run_path(str(SETUP_PY))
+
+    cuda_root = tmp_path / "cuda"
+    cuda_include = cuda_root / "include"
+    cuda_include.mkdir(parents=True)
+    (cuda_include / "cuda_runtime.h").touch()
+
+    site_packages = tmp_path / "site-packages"
+    wheel_include = site_packages / "nvidia" / "cu13" / "include"
+    wheel_include.mkdir(parents=True)
+    (wheel_include / "cuda_runtime.h").touch()
+    (wheel_include / "cublas_v2.h").touch()
+
+    builder = setup_namespace["CudaKernelBuilder"]([], verbose=False)
+    monkeypatch.setattr(builder, "_cuda_toolkit_roots", lambda: iter([cuda_root]))
+    monkeypatch.setattr(builder, "_site_paths", lambda: iter([site_packages]))
+
+    include_dirs = builder._resolve_include_dirs()
+
+    assert str(cuda_include) not in include_dirs
+    assert str(wheel_include) in include_dirs
+
+
+@pytest.mark.parametrize(
+    ("launcher", "expected_prefix"),
+    [
+        (None, []),
+        ("ccache", ["ccache"]),
+        ("ccache --verbose", ["ccache", "--verbose"]),
+    ],
+)
+def test_cuda_compile_command_preserves_optional_launcher(
+    launcher, expected_prefix, monkeypatch
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    if launcher is None:
+        monkeypatch.delenv("TOKENSPEED_KERNEL_NVCC_LAUNCHER", raising=False)
+    else:
+        monkeypatch.setenv("TOKENSPEED_KERNEL_NVCC_LAUNCHER", launcher)
+    monkeypatch.setattr(setuptools, "setup", lambda **_kwargs: None)
+    setup_namespace = runpy.run_path(str(SETUP_PY))
+    calls = []
+    monkeypatch.setattr(subprocess, "check_call", calls.append)
+
+    builder = setup_namespace["CudaKernelBuilder"]([], verbose=False)
+    builder._compile_one(
+        "source.cu",
+        "source.o",
+        ["-O3"],
+        ["/cuda/include"],
+        ["--use_fast_math"],
+    )
+
+    assert calls == [
+        expected_prefix
+        + [
+            setup_namespace["NVCC"],
+            "-O3",
+            "--use_fast_math",
+            "-I/cuda/include",
+            "-c",
+            "source.cu",
+            "-o",
+            "source.o",
+        ]
+    ]

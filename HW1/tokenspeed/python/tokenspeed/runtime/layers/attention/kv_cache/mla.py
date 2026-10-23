@@ -1,0 +1,244 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+from typing import ClassVar
+
+import numpy as np
+import torch
+from tokenspeed_kernel.ops.attention.prologue import (
+    LatentKVCache,
+    PerTokenHeadPlanes,
+)
+from tokenspeed_kernel.ops.kvcache.per_token_head import store_latent_per_token_head
+from tokenspeed_kernel.ops.kvcache.triton import (
+    get_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton,
+)
+
+from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+
+def _get_tensor_size_bytes(t: torch.Tensor | list[torch.Tensor]):
+    if isinstance(t, list):
+        return sum(_get_tensor_size_bytes(x) for x in t)
+    return np.prod(t.shape) * t.dtype.itemsize
+
+
+class MLATokenToKVPool(CachePool):
+    # Whether latent writes replace NaN/Inf with finite values.
+    latent_write_sanitizes: ClassVar[bool] = False
+
+    def __init__(
+        self,
+        arena: CacheArena,
+        model_dtype: torch.dtype,
+        dtype: torch.dtype,
+        quant_method: str,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        rank: int,
+        *,
+        field_layer_offset: int = 0,
+    ):
+        super().__init__(
+            arena,
+            dtype,
+            rank,
+            field_layer_offset=field_layer_offset,
+        )
+        self.model_dtype = model_dtype
+        self.quant_method = quant_method
+
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.layer_num = layer_num
+        self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
+        self._bind_layer_planes()
+
+    # Quantized MLA splits one logical cache into three planes, so its
+    # per-layer entry is a tuple; the plain path is a single latent plane.
+    # Either way each plane is reshaped into the token rows its kernel reads.
+    layer_plane_bindings: ClassVar[dict[str, str]] = {
+        "latent_kv": "_latent_kv",
+        "latent_scale": "_latent_scale",
+        "rope_k": "_rope_k",
+    }
+
+    def _bind_layer_planes(self) -> None:
+        super()._bind_layer_planes()
+        if self.quant_method == "per_token_head":
+            self.kv_buffer = list(
+                zip(self._latent_kv, self._latent_scale, self._rope_k, strict=True)
+            )
+        else:
+            self.kv_buffer = self._latent_kv
+
+    def get_kv_size_bytes(self):
+        assert hasattr(self, "kv_buffer")
+        kv_size_bytes = 0
+        for kv_cache in self.kv_buffer:
+            kv_size_bytes += _get_tensor_size_bytes(kv_cache)
+        return kv_size_bytes
+
+    def get_key_buffer(self, layer_id: int):
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
+        buffer = self.kv_buffer[layer_id]
+        if buffer is None:
+            raise ValueError(f"layer {layer_id} is a KDA state layer")
+        if self.quant_method == "per_token_head":
+            return buffer
+        elif self.store_dtype != self.dtype:
+            return buffer.view(self.dtype)
+        else:
+            return buffer
+
+    def get_value_buffer(self, layer_id: int):
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
+        buffer = self.kv_buffer[layer_id]
+        if buffer is None:
+            raise ValueError(f"layer {layer_id} is a KDA state layer")
+        if self.quant_method == "per_token_head":
+            return buffer[:2]
+        elif self.store_dtype != self.dtype:
+            return buffer[..., : self.kv_lora_rank].view(self.dtype)
+        else:
+            return buffer[..., : self.kv_lora_rank]
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def kv_write_target(
+        self, layer_id: int, slots: torch.Tensor, write_mask: torch.Tensor | None
+    ) -> LatentKVCache:
+        """Where the attention prologue writes this layer's latent rows."""
+        buffer = self.get_key_buffer(layer_id)
+        if self.quant_method == "per_token_head":
+            buffer = PerTokenHeadPlanes(*buffer)
+        return LatentKVCache(
+            kv_cache=buffer,
+            sanitize=self.latent_write_sanitizes,
+            slots=slots,
+            write_mask=write_mask,
+        )
+
+    def set_kv_buffer(
+        self,
+        layer: PagedAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        self.set_mla_kv_buffer(
+            layer,
+            loc,
+            cache_k[..., : self.kv_lora_rank],
+            cache_k[..., self.kv_lora_rank :],
+            write_mask=None,
+        )
+
+    def set_mla_kv_buffer(
+        self,
+        layer: PagedAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+        sanitize: bool | None = None,
+        *,
+        write_mask: torch.Tensor | None,
+    ):
+        """Write physical local slots, suppressing rows excluded by write_mask.
+
+        None writes every supplied row. Address translation and distributed
+        communication belong to the caller, never this local storage view.
+        """
+        if sanitize is None:
+            sanitize = self.latent_write_sanitizes
+        layer_id = layer.layer_id
+        if self.quant_method == "per_token_head":
+            if write_mask is not None:
+                raise ValueError("Per-token quantized MLA writes do not support a mask")
+            store_latent_per_token_head(
+                *self.kv_buffer[layer_id],
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                sanitize=sanitize,
+            )
+        else:
+            kv_buffer = self.kv_buffer[layer_id]
+            if self.store_dtype != self.dtype:
+                # The arena stores FP8 rows as bytes. Give the scatter kernel an
+                # FP8 view so its stores quantize mixed-dtype sources in place.
+                kv_buffer = kv_buffer.view(self.dtype)
+
+            set_mla_kv_buffer_triton(
+                kv_buffer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                sanitize=sanitize,
+                write_mask=write_mask,
+            )
+
+    def get_mla_kv_buffer(
+        self,
+        layer: PagedAttention,
+        loc: torch.Tensor,
+        dst_dtype: torch.dtype | None = None,
+    ):
+        layer_id = layer.layer_id
+        dst_dtype = dst_dtype or self.dtype
+
+        if self.quant_method == "per_token_head":
+            k_lora_cache, k_scale_cache, k_rope_cache = self.kv_buffer[layer_id]
+            k_lora = k_lora_cache[loc].view(self.dtype).float()
+            k_scale = k_scale_cache[loc]
+            k_rope = k_rope_cache[loc].float()
+            cache_k_nope = (k_lora * k_scale).to(dst_dtype).contiguous()
+            cache_k_rope = (k_rope * k_scale).to(dst_dtype).contiguous()
+            return cache_k_nope, cache_k_rope
+
+        return self.read_latent_rows(self.get_key_buffer(layer_id), loc, dst_dtype)
+
+    def read_latent_rows(
+        self, rows: torch.Tensor, loc: torch.Tensor, dst_dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split rows ``loc`` of a ``[slots, 1, kv_cache_dim]`` latent plane in
+        the cache dtype -- this pool's own, or rows gathered from page owners
+        -- into ``dst_dtype`` latent and RoPE keys."""
+        cache_k_nope = torch.empty(
+            (loc.shape[0], 1, self.kv_lora_rank),
+            dtype=dst_dtype,
+            device=rows.device,
+        )
+        cache_k_rope = torch.empty(
+            (loc.shape[0], 1, self.qk_rope_head_dim),
+            dtype=dst_dtype,
+            device=rows.device,
+        )
+        get_mla_kv_buffer_triton(rows, loc, cache_k_nope, cache_k_rope)
+        return cache_k_nope, cache_k_rope

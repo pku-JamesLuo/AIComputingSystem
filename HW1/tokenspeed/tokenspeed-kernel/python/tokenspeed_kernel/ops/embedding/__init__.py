@@ -1,0 +1,527 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+
+@dataclass
+class FusedSetKVBufferArg:
+    value: torch.Tensor
+    k_buffer: torch.Tensor
+    v_buffer: torch.Tensor
+    cache_loc: torch.Tensor
+
+
+@dataclass
+class FusedMLASetKVBufferArg:
+    k_nope: torch.Tensor
+    kv_buffer: torch.Tensor
+    cache_loc: torch.Tensor
+    # Setting the absorbed query half makes the write assemble the whole query.
+    q_nope: torch.Tensor | None
+    # Clamp NaN/inf on the latent store only, as set_mla_kv_buffer_triton does.
+    sanitize: bool
+    # True per token to store its latent row; None stores every row.
+    write_mask: torch.Tensor | None
+
+
+def apply_rope(
+    # embedding inputs
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    # embedding options
+    is_neox: bool = True,
+    fused_set_kv_buffer_arg: FusedSetKVBufferArg | None = None,
+    q_rope_out: torch.Tensor | None = None,
+    k_rope_out: torch.Tensor | None = None,
+    # dispatch options
+    solution: str | None = None,
+    override: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary embedding through the registered embedding.rope kernel.
+
+    Args:
+        positions: Token positions. Flattened to [num_tokens] before dispatch.
+        q: Query tensor with shape [num_tokens, num_q_heads * head_size].
+        k: Key tensor with shape [num_tokens, num_kv_heads * head_size].
+        head_size: Per-head hidden dimension.
+        cos_sin_cache: Packed RoPE cache with shape [max_position, rotary_dim]
+            as concat(cos, sin) along the last dimension.
+        is_neox: Whether to use Neox-style half-split rotation. False uses
+            GPT-J interleaved-pair rotation.
+        fused_set_kv_buffer_arg: Optional fused KV-cache write arguments; the
+            cache is written at unit scale.
+        q_rope_out: Optional output buffer for the rotated query. If omitted,
+            q is updated in place.
+        k_rope_out: Optional output buffer for the rotated key. If omitted,
+            k is updated in place.
+        solution: Optional registered solution to select.
+        override: Optional exact kernel-name or solution override.
+
+    Returns:
+        (rotated_q, rotated_k). These are q_rope_out / k_rope_out when provided,
+        otherwise the input q / k.
+    """
+    rotary_dim = cos_sin_cache.shape[-1]
+    assert rotary_dim % 2 == 0, "embedding.rope requires even rotary_dim"
+    assert rotary_dim <= head_size, "embedding.rope requires rotary_dim <= head_size"
+
+    positions = positions.flatten()
+    num_tokens = positions.shape[0]
+    if num_tokens == 0:
+        return (
+            q_rope_out if q_rope_out is not None else q,
+            k_rope_out if k_rope_out is not None else k,
+        )
+    num_q_heads = q.numel() // (num_tokens * head_size)
+    num_kv_heads = k.numel() // (num_tokens * head_size)
+
+    traits = {
+        "head_size": head_size,
+        "rotary_dim": rotary_dim,
+        "partial_rotary": rotary_dim != head_size,
+        "is_neox": is_neox,
+        "has_fused_kv": fused_set_kv_buffer_arg is not None,
+        "has_q_out": q_rope_out is not None,
+        "has_k_out": k_rope_out is not None,
+    }
+    signature = format_signature(
+        q=dense_tensor_format(q.dtype),
+        k=dense_tensor_format(k.dtype),
+    )
+    kernel = select_kernel(
+        "embedding",
+        "rope",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "num_tokens": num_tokens,
+        "num_q_heads": num_q_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_size": head_size,
+        "rotary_dim": rotary_dim,
+        "has_fused_kv": fused_set_kv_buffer_arg is not None,
+        "has_q_out": q_rope_out is not None,
+        "has_k_out": k_rope_out is not None,
+    }
+    ShapeCapture.get().record(
+        "embedding",
+        "rope",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "embedding",
+        "rope",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel(
+            positions=positions,
+            q=q,
+            k=k,
+            head_size=head_size,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=is_neox,
+            fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
+            q_rope_out=q_rope_out,
+            k_rope_out=k_rope_out,
+            enable_pdl=pdl_enabled(),
+        )
+
+    return (
+        q_rope_out if q_rope_out is not None else q,
+        k_rope_out if k_rope_out is not None else k,
+    )
+
+
+def apply_k_rope(
+    positions: torch.Tensor,
+    k: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    *,
+    is_neox: bool = True,
+    k_rope_out: torch.Tensor | None = None,
+    solution: str | None = None,
+    override: str | None = None,
+) -> torch.Tensor:
+    """Rotate keys that have no query to be paired with.
+
+    Context injection rotates a key row on its own. Every registered rope
+    kernel grids over ``num_q_heads + num_k_heads``, so a zero-width query
+    launches no query work at all -- unlike the same-shaped scratch query a
+    caller would otherwise have to allocate and rotate.
+
+    Args:
+        positions: Token positions ``[num_tokens]``.
+        k: Key tensor ``[num_tokens, num_kv_heads * head_size]``.
+        head_size: Per-head hidden dimension.
+        cos_sin_cache: ``[max_position, rotary_dim]`` as concat(cos, sin).
+        is_neox: Half-split rotation. False uses GPT-J interleaved pairs.
+        k_rope_out: Optional output buffer; ``k`` is rotated in place without
+            one.
+        solution: Optional registered solution to select.
+        override: Optional exact kernel-name or solution override.
+
+    Returns:
+        The rotated key, which is ``k_rope_out`` when provided.
+    """
+    _, rotated = apply_rope(
+        positions,
+        k.new_empty((positions.numel(), 0)),
+        k,
+        head_size,
+        cos_sin_cache,
+        is_neox=is_neox,
+        k_rope_out=k_rope_out,
+        solution=solution,
+        override=override,
+    )
+    return rotated
+
+
+def apply_rope_mla(
+    # embedding inputs
+    positions: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_nope: torch.Tensor,
+    k_nope: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    # embedding options
+    is_neox: bool = True,
+    quantize_dtype: torch.dtype = torch.float8_e4m3fn,
+    quant_scale_q: float | torch.Tensor = 1.0,
+    quant_scale_kv: float | torch.Tensor = 1.0,
+    q_rope_out: torch.Tensor | None = None,
+    k_rope_out: torch.Tensor | None = None,
+    q_nope_out: torch.Tensor | None = None,
+    k_nope_out: torch.Tensor | None = None,
+    # dispatch options
+    solution: str | None = None,
+    override: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply MLA RoPE and quantize query/key parts to FP8.
+
+    With ``cos_sin_cache=None`` the rotation is skipped (NoPE models such as
+    Kimi-K3): the parts are quantized straight into the combined layout, and
+    a single-head ``k_rope`` broadcasts across the query heads.
+
+    Args:
+        positions: Token positions. Flattened to [tokens] before dispatch.
+        q_rope: Query RoPE slice with shape [tokens, q_heads, rope_dim].
+        k_rope: Key RoPE slice with shape [tokens, kv_heads, rope_dim].
+        q_nope: Query non-RoPE slice with shape [tokens, q_heads, nope_dim].
+        k_nope: Key non-RoPE slice with shape [tokens, kv_heads, nope_dim].
+        cos_sin_cache: Packed RoPE cache as concat(cos, sin) on the last dim.
+        is_neox: Whether to use Neox-style half-split rotation.
+        quantize_dtype: Output FP8 dtype. Currently only e4m3fn is supported.
+        quant_scale_q: Quantization scale multiplied into query tensors before
+            the FP8 cast.
+        quant_scale_kv: Quantization scale multiplied into key tensors before
+            the FP8 cast.
+        q_rope_out: Optional FP8 output buffer for rotated q_rope. If omitted
+            together with q_nope_out, a combined query output is allocated and
+            this slice is derived from it.
+        k_rope_out: Optional FP8 output buffer for rotated k_rope. If omitted
+            together with k_nope_out, a combined key output is allocated and this
+            slice is derived from it.
+        q_nope_out: Optional FP8 output buffer for q_nope. If omitted together
+            with q_rope_out, a combined query output is allocated and this slice
+            is derived from it.
+        k_nope_out: Optional FP8 output buffer for k_nope. If omitted together
+            with k_rope_out, a combined key output is allocated and this slice is
+            derived from it.
+        solution: Optional registered solution to select.
+        override: Optional exact kernel-name or solution override.
+
+    Returns:
+        (query_fp8, key_fp8), where the last dimension is concat(nope, rope).
+    """
+    positions = positions.flatten() if cos_sin_cache is not None else positions
+    query_fp8 = None
+    key_fp8 = None
+
+    if q_rope_out is None and q_nope_out is None:
+        query_fp8 = torch.empty(
+            q_nope.shape[:-1] + (q_nope.shape[-1] + q_rope.shape[-1],),
+            dtype=quantize_dtype,
+            device=q_nope.device,
+        )
+        q_nope_out = query_fp8[..., : q_nope.shape[-1]]
+        q_rope_out = query_fp8[..., q_nope.shape[-1] :]
+    else:
+        q_rope_out = (
+            torch.empty(q_rope.shape, dtype=quantize_dtype, device=q_rope.device)
+            if q_rope_out is None
+            else q_rope_out
+        )
+        q_nope_out = (
+            torch.empty(q_nope.shape, dtype=quantize_dtype, device=q_nope.device)
+            if q_nope_out is None
+            else q_nope_out
+        )
+
+    if k_rope_out is None and k_nope_out is None:
+        key_fp8 = torch.empty(
+            k_nope.shape[:-1] + (k_nope.shape[-1] + k_rope.shape[-1],),
+            dtype=quantize_dtype,
+            device=k_nope.device,
+        )
+        k_nope_out = key_fp8[..., : k_nope.shape[-1]]
+        k_rope_out = key_fp8[..., k_nope.shape[-1] :]
+    else:
+        k_rope_out = (
+            torch.empty(k_rope.shape, dtype=quantize_dtype, device=k_rope.device)
+            if k_rope_out is None
+            else k_rope_out
+        )
+        k_nope_out = (
+            torch.empty(k_nope.shape, dtype=quantize_dtype, device=k_nope.device)
+            if k_nope_out is None
+            else k_nope_out
+        )
+
+    num_tokens = q_rope.shape[0]
+    if num_tokens == 0:
+        return (
+            (
+                query_fp8
+                if query_fp8 is not None
+                else torch.cat((q_nope_out, q_rope_out), dim=-1)
+            ),
+            (
+                key_fp8
+                if key_fp8 is not None
+                else torch.cat((k_nope_out, k_rope_out), dim=-1)
+            ),
+        )
+
+    traits = {
+        "has_rope": cos_sin_cache is not None,
+        "is_neox": bool(is_neox),
+        "quantize_dtype": quantize_dtype,
+        "has_scale_q_tensor": isinstance(quant_scale_q, torch.Tensor),
+        "has_scale_kv_tensor": isinstance(quant_scale_kv, torch.Tensor),
+    }
+    signature = format_signature(
+        q_rope=dense_tensor_format(q_rope.dtype),
+        k_rope=dense_tensor_format(k_rope.dtype),
+        q_nope=dense_tensor_format(q_nope.dtype),
+        k_nope=dense_tensor_format(k_nope.dtype),
+    )
+    kernel = select_kernel(
+        "embedding",
+        "rope_mla",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "num_tokens": num_tokens,
+        "q_heads": q_rope.shape[1],
+        "kv_heads": k_rope.shape[1],
+        "q_nope_dim": q_nope.shape[-1],
+        "k_nope_dim": k_nope.shape[-1],
+        "rope_dim": q_rope.shape[-1],
+        "is_neox": bool(is_neox),
+    }
+    ShapeCapture.get().record(
+        "embedding",
+        "rope_mla",
+        kernel.name,
+        q_rope.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "embedding",
+        "rope_mla",
+        q_rope.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel(
+            positions=positions,
+            q_rope=q_rope,
+            k_rope=k_rope,
+            q_nope=q_nope,
+            k_nope=k_nope,
+            cos_sin_cache=cos_sin_cache,
+            q_rope_out=q_rope_out,
+            k_rope_out=k_rope_out,
+            q_nope_out=q_nope_out,
+            k_nope_out=k_nope_out,
+            is_neox=is_neox,
+            quant_scale_q=quant_scale_q,
+            quant_scale_kv=quant_scale_kv,
+            enable_pdl=pdl_enabled(),
+        )
+
+    query_fp8 = (
+        query_fp8
+        if query_fp8 is not None
+        else torch.cat((q_nope_out, q_rope_out), dim=-1)
+    )
+    key_fp8 = (
+        key_fp8 if key_fp8 is not None else torch.cat((k_nope_out, k_rope_out), dim=-1)
+    )
+    return query_fp8, key_fp8
+
+
+__all__ = [
+    "FusedMLASetKVBufferArg",
+    "FusedSetKVBufferArg",
+    "apply_k_rope",
+    "apply_rope",
+    "apply_rope_mla",
+    "vocab_shard_embedding",
+]
+
+
+import tokenspeed_kernel.ops.embedding.ascend  # noqa: E402,F401
+
+# Backend registration (side-effect imports).
+import tokenspeed_kernel.ops.embedding.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.embedding.flashinfer  # noqa: E402,F401
+import tokenspeed_kernel.ops.embedding.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.embedding.triton_host_gather  # noqa: E402,F401
+
+
+def mxfp8_embedding(weight, scales, indices, row_start, row_end):
+    """Gather BF16 embeddings from a row shard of an MXFP8 table.
+
+    Args:
+        weight: FP8 E4M3 codes [local_capacity,D], with contiguous columns.
+        scales: E8M0 exponent bytes [local_capacity,D/32].
+        indices: Contiguous integer IDs of any shape, on the table's GPU.
+        row_start: Global ID of the first locally owned row.
+        row_end: Exclusive end of locally owned rows, before capacity padding.
+
+    Returns:
+        BF16 embeddings [*indices.shape,D]; nonlocal IDs produce zero rows.
+        The caller owns any collective needed to combine shards.
+    """
+    if weight.ndim != 2 or weight.shape[1] % 32 or weight.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "MXFP8 embedding weight must be E4M3 [rows,D] with D divisible by 32"
+        )
+    if (
+        scales.shape != (weight.shape[0], weight.shape[1] // 32)
+        or scales.dtype != torch.uint8
+    ):
+        raise ValueError("MXFP8 embedding scales must be E8M0 bytes [rows,D/32]")
+    if not 0 <= row_start <= row_end <= row_start + weight.shape[0]:
+        raise ValueError("MXFP8 embedding shard range exceeds table capacity")
+    if (
+        not indices.is_cuda
+        or indices.dtype not in (torch.int32, torch.int64)
+        or not indices.is_contiguous()
+        or weight.stride(1) != 1
+        or scales.stride(1) != 1
+        or weight.device != indices.device
+        or scales.device != indices.device
+    ):
+        raise ValueError(
+            "MXFP8 embedding requires colocated GPU tensors and contiguous IDs/columns"
+        )
+    kernel = select_kernel(
+        "embedding",
+        "mxfp8_embedding",
+        format_signature(weight=dense_tensor_format(weight.dtype)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(weight, scales, indices, row_start, row_end)
+
+
+def vocab_shard_embedding(
+    weight: torch.Tensor,
+    indices: torch.Tensor,
+    org_range: tuple[int, int],
+    num_org_padding: int,
+    added_range: tuple[int, int],
+) -> torch.Tensor:
+    """Gather one vocabulary shard's embeddings, zeroing IDs of other shards.
+
+    The shard holds its original-vocabulary rows ``org_range`` (global
+    ``[start, end)``), ``num_org_padding`` padding rows, then its added
+    (LoRA) rows ``added_range``. IDs outside both ranges produce zero rows,
+    so summing every shard's output over the model-parallel group yields the
+    full embedding; the caller owns that collective.
+
+    Args:
+        weight: Floating ``[local_capacity, D]`` shard with contiguous columns.
+        indices: Contiguous integer IDs of any shape, on the shard's GPU.
+        org_range: Global ``(start, end)`` of the shard's original rows.
+        num_org_padding: Padding rows between the original and added rows.
+        added_range: Global ``(start, end)`` of the shard's added rows.
+
+    Returns:
+        ``[*indices.shape, D]`` embeddings in the weight's dtype.
+    """
+    org_start, org_end = org_range
+    added_start, added_end = added_range
+    if weight.ndim != 2 or weight.stride(1) != 1 or not weight.is_floating_point():
+        raise ValueError(
+            "vocabulary shard weight must be floating [rows, D] with contiguous columns"
+        )
+    if not (0 <= org_start <= org_end and 0 <= added_start <= added_end):
+        raise ValueError("vocabulary shard ranges must be ordered and non-negative")
+    if (org_end - org_start) + num_org_padding + (
+        added_end - added_start
+    ) > weight.shape[0]:
+        raise ValueError("vocabulary shard ranges exceed the weight's rows")
+    if (
+        not indices.is_cuda
+        or indices.dtype not in (torch.int32, torch.int64)
+        or not indices.is_contiguous()
+        or weight.device != indices.device
+    ):
+        raise ValueError(
+            "vocabulary shard gather requires colocated GPU tensors and contiguous IDs"
+        )
+    kernel = select_kernel(
+        "embedding",
+        "vocab_shard_embedding",
+        format_signature(weight=dense_tensor_format(weight.dtype)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(weight, indices, org_range, num_org_padding, added_range)

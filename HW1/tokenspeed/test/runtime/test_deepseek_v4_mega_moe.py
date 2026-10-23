@@ -1,0 +1,81 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+
+import os
+import sys
+
+import pytest
+import torch
+from torch import nn
+
+from tokenspeed.runtime.layers.moe.types import MoELayerSpec
+from tokenspeed.runtime.layers.moe.weights.mxfp4 import create_mxfp4_weight_pair
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=20, suite="runtime-1gpu")
+
+
+class TestDeepseekV4MegaMoE:
+    def test_standard_mxfp4_weights_load_expert_shards(self):
+        experts = nn.Module()
+        spec = MoELayerSpec(
+            top_k=2,
+            num_experts=4,
+            num_local_experts=2,
+            hidden_size=128,
+            intermediate_size=128,
+            activation="swiglu",
+            tp_rank=0,
+            tp_size=1,
+            ep_rank=0,
+            ep_size=2,
+        )
+        create_mxfp4_weight_pair(spec, experts)
+
+        w1 = torch.full((128, 64), 1, dtype=torch.uint8)
+        w3 = torch.full((128, 64), 3, dtype=torch.uint8)
+        w2 = torch.full((128, 64), 2, dtype=torch.uint8)
+        s1 = torch.full((128, 4), 11, dtype=torch.uint8)
+        s3 = torch.full((128, 4), 13, dtype=torch.uint8)
+        s2 = torch.full((128, 4), 12, dtype=torch.uint8)
+
+        experts.w13_weight.weight_loader(
+            experts.w13_weight, w1, "w1", local_expert_id=1
+        )
+        experts.w13_weight.weight_loader(
+            experts.w13_weight, w3, "w3", local_expert_id=1
+        )
+        experts.w2_weight.weight_loader(experts.w2_weight, w2, "w2", local_expert_id=1)
+        experts.w13_weight_scale.weight_loader(
+            experts.w13_weight_scale, s1, "w1", local_expert_id=1
+        )
+        experts.w13_weight_scale.weight_loader(
+            experts.w13_weight_scale, s3, "w3", local_expert_id=1
+        )
+        experts.w2_weight_scale.weight_loader(
+            experts.w2_weight_scale, s2, "w2", local_expert_id=1
+        )
+
+        torch.testing.assert_close(experts.w13_weight[1, :128], w1)
+        torch.testing.assert_close(experts.w13_weight[1, 128:], w3)
+        torch.testing.assert_close(experts.w2_weight[1], w2)
+        torch.testing.assert_close(experts.w13_weight_scale[1, :128], s1)
+        torch.testing.assert_close(experts.w13_weight_scale[1, 128:], s3)
+        torch.testing.assert_close(experts.w2_weight_scale[1], s2)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

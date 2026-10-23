@@ -1,0 +1,734 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""LLaMA Eagle3 draft model for speculative decoding.
+
+Extends base classes. Preserves the low-latency fused allreduce+norm
+path from the original implementation.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+
+import torch
+from torch import nn
+from transformers import LlamaConfig
+
+from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.context import (
+    ForwardContext,
+    report_collective_sizing,
+)
+from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.attention.configs.base import resolve_cache_layer_types
+from tokenspeed.runtime.layers.common import concat
+from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
+from tokenspeed.runtime.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+from tokenspeed.runtime.layers.paged_attention import hf_sliding_window_to_window_left
+from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.models.base import (
+    BaseCausalLM,
+    BaseDecoderLayer,
+    BaseTransformerModel,
+)
+from tokenspeed.runtime.models.llama import LlamaAttention as BaseLlamaAttention
+from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
+
+logger = get_colorful_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Attention
+# ---------------------------------------------------------------------------
+
+
+def _draft_window_left(config: LlamaConfig) -> int:
+    """``window_left`` of the draft layer from the labels its cache plan reads: -1 unless sliding."""
+    layer_types = resolve_cache_layer_types(
+        config,
+        num_layers=config.num_hidden_layers,
+        is_draft=True,
+        draft_block_decode=False,
+    ) or ("full_attention",)
+    if layer_types[0] == "full_attention":
+        return -1
+    if layer_types[0] == "sliding_attention":
+        return hf_sliding_window_to_window_left(config.sliding_window)
+    raise ValueError(f"unsupported draft layer type {layer_types[0]!r}")
+
+
+class LlamaAttention(BaseLlamaAttention):
+    """Eagle3 draft head attention.
+
+    Inherits the projection setup (with ``qkv_input_size=2*hidden_size`` for
+    the [embed || hidden] concat) and ``forward`` (= qkv_proj + o_proj
+    scaffolding) from base. Overrides ``_attn`` so the draft's first step
+    skips dead catch-up rows: on backends that support a narrowed draft
+    decode, the prologue writes every row and q is sliced to one live row per
+    request and dispatched as DECODE; otherwise the fallback runs the full
+    N-row attn and post-slices the output.
+    Inactive draft steps delegate to base.
+    """
+
+    def _attn(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        # Only the active draft first step narrows; later steps delegate to base.
+        if ctx.draft_narrowing is None:
+            return super()._attn(positions, q, k, v, ctx)
+
+        if not ctx.attn_backend.supports_narrowed_draft_decode(ctx.forward_mode):
+            return self.attn(q, k, v, positions, ctx).index_select(0, ctx.gather_ids)
+        return self.attn.attend_live_rows(q, k, v, positions, ctx)
+
+
+# ---------------------------------------------------------------------------
+# MLP
+# ---------------------------------------------------------------------------
+
+
+class LlamaMLP(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+
+        super().__init__()
+        tp_rank = mapping.dense.tp_rank
+        tp_size = mapping.dense.tp_size
+        tp_group = mapping.dense.tp_group
+
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            tp_group=tp_group,
+            prefix=add_prefix("gate_up_proj", prefix),
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=False,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            tp_group=tp_group,
+            prefix=add_prefix("down_proj", prefix),
+        )
+        self.act_fn = SiluAndMul()
+        self.gateup_unquanted = quant_config is None
+
+    def forward(self, x, block_scale=None):
+
+        if x.shape[0] == 0:
+            return x
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Decoder layer
+# ---------------------------------------------------------------------------
+
+
+class Eagle3DecoderLayer(BaseDecoderLayer):
+    """Eagle3 decoder layer with low-latency fused allreduce+norm path.
+
+    Inherits norm/attn/mlp/comm_manager init from BaseDecoderLayer.
+    Overrides forward with eagle3-specific embed+hidden concat logic.
+    """
+
+    def __init__(
+        self,
+        config: LlamaConfig,
+        layer_id: int,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+
+        self._eagle3_config = config
+        self._eagle3_mapping = mapping
+        self._eagle3_quant_config = quant_config
+        self._eagle3_prefix = prefix
+
+        super().__init__(
+            config=config,
+            layer_id=layer_id,
+            mapping=mapping,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+        self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fused_input_hidden_norm = FusedRMSNorm(
+            self.input_layernorm,
+            self.hidden_norm,
+        )
+
+    def resolve_attn(self, prefix: str) -> nn.Module:
+
+        config = self._eagle3_config
+        return LlamaAttention(
+            config,
+            self._eagle3_mapping,
+            hidden_size=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            layer_id=self.layer_id,
+            quant_config=self._eagle3_quant_config,
+            prefix=add_prefix("self_attn", prefix),
+            qkv_input_size=2 * config.hidden_size,
+            sliding_window_size=_draft_window_left(config),
+        )
+
+    def resolve_mlp(self, prefix: str) -> nn.Module:
+
+        config = self._eagle3_config
+        inter_size = (
+            config.intermediate_size_mlp
+            if config.model_type == "llama4_text"
+            else config.intermediate_size
+        )
+
+        return LlamaMLP(
+            config.hidden_size,
+            inter_size,
+            config.hidden_act,
+            self._eagle3_mapping,
+            self._eagle3_quant_config,
+            prefix=f"{prefix}.mlp",
+        )
+
+    def _maybe_narrow_residual(
+        self,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Align residual with attn output narrowed to [bs, H]."""
+        if ctx.draft_narrowing is not None and not ctx.forward_mode.is_idle():
+            return residual.index_select(0, ctx.gather_ids)
+        return residual
+
+    def forward_low_latency(
+        self,
+        positions: torch.Tensor,
+        embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        residual: torch.Tensor | None,
+        final_norm: RMSNorm = None,
+        fuse_embed_reduce: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        residual = hidden_states
+
+        if fuse_embed_reduce:
+            # Fuse embedding allreduce with input_layernorm.
+            embeds, _, *_ = self.input_layernorm.forward_with_allreduce_fusion(
+                self.mapping.attn.tp_rank,
+                self.mapping.attn.tp_group,
+                embeds,
+                torch.zeros_like(embeds),
+            )
+            hidden_states = self.hidden_norm(hidden_states)
+            hidden_states = concat(embeds, hidden_states)
+        else:
+            h = embeds.size(-1)
+            fused_norm_out = torch.empty(
+                embeds.size(0),
+                h + hidden_states.size(-1),
+                dtype=embeds.dtype,
+                device=embeds.device,
+            )
+            # FusedRMSNorm's q_a/kv_a kwargs are MLA-specific names. Here
+            # embeds and hidden_states correspond to q_a and kv_a, separately.
+            # Skip the launch on zero-token (idle) forwards.
+            if embeds.shape[0] > 0:
+                self.fused_input_hidden_norm(
+                    input_q_a=embeds,
+                    input_kv_a=hidden_states,
+                    output_q_a=fused_norm_out[..., :h],
+                    output_kv_a=fused_norm_out[..., h:],
+                )
+            hidden_states = fused_norm_out
+
+        # Attention
+        hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            ctx=ctx,
+        )
+        residual = self._maybe_narrow_residual(residual, ctx)
+
+        # Fused post-attn allreduce + norm (uses attn tp group)
+        block_scale = None
+        hidden_states, residual, block_scale, *_ = (
+            self.post_attention_layernorm.forward_with_allreduce_fusion(
+                self.mapping.attn.tp_rank,
+                self.mapping.attn.tp_group,
+                hidden_states,
+                residual,
+                fuse_block_quant_fp8=not self.mlp.gateup_unquanted,
+            )
+        )
+
+        hidden_states = self.mlp(hidden_states, block_scale)
+
+        # Fused final allreduce + norm (uses dense tp group)
+        hidden_states, residual, *_ = final_norm.forward_with_allreduce_fusion(
+            self.mapping.dense.tp_rank,
+            self.mapping.dense.tp_group,
+            hidden_states,
+            residual,
+            fuse_block_quant_fp8=False,
+        )
+
+        return hidden_states, residual
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        residual: torch.Tensor | None,
+        final_norm: RMSNorm = None,
+        fuse_embed_reduce: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        if self.comm_manager.should_fuse(hidden_states.shape[0]):
+            return self.forward_low_latency(
+                positions,
+                embeds,
+                hidden_states,
+                ctx,
+                residual,
+                final_norm,
+                fuse_embed_reduce=fuse_embed_reduce,
+            )
+
+        # Non-fused path: fuse_embed_reduce is always False here because
+        # the model only sets it when should_fuse() is True.
+        residual = hidden_states
+        h = embeds.size(-1)
+        fused_norm_out = torch.empty(
+            embeds.size(0),
+            h + hidden_states.size(-1),
+            dtype=embeds.dtype,
+            device=embeds.device,
+        )
+        # FusedRMSNorm's q_a/kv_a kwargs are MLA-specific names. Here
+        # embeds and hidden_states correspond to q_a and kv_a, separately.
+        # Skip the launch on zero-token (idle) forwards.
+        if embeds.shape[0] > 0:
+            self.fused_input_hidden_norm(
+                input_q_a=embeds,
+                input_kv_a=hidden_states,
+                output_q_a=fused_norm_out[..., :h],
+                output_kv_a=fused_norm_out[..., h:],
+            )
+        hidden_states = fused_norm_out
+
+        # Attention
+        hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            ctx=ctx,
+        )
+        residual = self._maybe_narrow_residual(residual, ctx)
+        hidden_states, residual = self.comm_manager.post_attn_comm(
+            hidden_states, residual, ctx
+        )
+
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        # MLP
+        hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.comm_manager.post_mlp_comm(
+            hidden_states, residual, ctx
+        )
+
+        return hidden_states, residual
+
+
+# ---------------------------------------------------------------------------
+# Model and CausalLM
+# ---------------------------------------------------------------------------
+
+
+class Eagle3LlamaModel(BaseTransformerModel):
+
+    layer_cls = Eagle3DecoderLayer
+
+    def __init__(
+        self,
+        config: LlamaConfig,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+
+        super().__init__(
+            config=config,
+            mapping=mapping,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+        # Eagle3 uses "midlayer" (not "layers.0") in checkpoint weights.
+        # Re-register the single layer under the correct name.
+        self.midlayer = self.layers[0]
+        del self.layers
+
+        self.num_fc_input_dim = (
+            len(config.eagle_aux_hidden_state_layer_ids)
+            if hasattr(config, "eagle_aux_hidden_state_layer_ids")
+            else 3
+        )
+
+        self.fc = ColumnParallelLinear(
+            config.hidden_size * self.num_fc_input_dim,
+            config.hidden_size,
+            bias=False,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=add_prefix("fc", prefix),
+            tp_rank=self.mapping.attn.tp_rank,
+            tp_size=self.mapping.attn.tp_size,
+            tp_group=self.mapping.attn.tp_group,
+        )
+
+        # norm_before_fc: RMSNorm over the concatenated aux states before fc (replicated)
+        self.input_norm = (
+            RMSNorm(
+                config.hidden_size * self.num_fc_input_dim,
+                eps=config.rms_norm_eps,
+            )
+            if getattr(config, "norm_before_fc", False)
+            else None
+        )
+        self.fc_norm = (
+            nn.ModuleList(
+                [
+                    RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                    for _ in range(self.num_fc_input_dim)
+                ]
+            )
+            if getattr(config, "fc_norm", False)
+            else None
+        )
+        self.fused_fc_norms = (
+            nn.ModuleList(
+                [
+                    FusedRMSNorm(self.fc_norm[i], self.fc_norm[i + 1])
+                    for i in range(0, self.num_fc_input_dim - 1, 2)
+                ]
+            )
+            if self.fc_norm is not None
+            else None
+        )
+        self.norm_output = getattr(config, "norm_output", False)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+        input_embeds: torch.Tensor = None,
+        hidden_states: torch.Tensor = None,
+    ) -> torch.Tensor:
+
+        if input_embeds is None:
+            # When the embedding is vocab-parallel (tp_size > 1), skip its
+            # NCCL allreduce and let the midlayer fuse it with input_layernorm.
+            # Non-sharded embeddings (tp_size == 1) need no allreduce at all.
+            midlayer = self.midlayer
+            num_tokens = input_ids.shape[0]
+            fuse_embed_reduce = (
+                self.embed_tokens.tp_size > 1
+                and midlayer.comm_manager.should_fuse(num_tokens)
+            )
+            embeds = self.embed_tokens(input_ids, reduce_results=not fuse_embed_reduce)
+        else:
+            embeds = input_embeds
+            fuse_embed_reduce = False
+
+        if hidden_states is None:
+            raise ValueError("Eagle3 forward requires hidden_states")
+
+        if hidden_states.size(-1) != embeds.size(-1):
+            if self.input_norm is not None:
+                hidden_states = self.input_norm(hidden_states)
+            if self.fc_norm is not None and hidden_states.shape[0] > 0:
+                chunks = hidden_states.chunk(self.num_fc_input_dim, dim=-1)
+                normed = torch.empty_like(hidden_states)
+                out_chunks = normed.chunk(self.num_fc_input_dim, dim=-1)
+                i = 0
+                for fused in self.fused_fc_norms:
+                    fused(
+                        input_q_a=chunks[i],
+                        input_kv_a=chunks[i + 1],
+                        output_q_a=out_chunks[i],
+                        output_kv_a=out_chunks[i + 1],
+                    )
+                    i += 2
+                if i < self.num_fc_input_dim:
+                    # Odd count: single norm into the last slice.
+                    self.fc_norm[i](chunks[i], out=out_chunks[i])
+                hidden_states = normed
+            hidden_states, _ = self.fc(hidden_states)
+
+        residual = None
+        midlayer = self.midlayer
+        hidden_states, residual = midlayer(
+            positions,
+            embeds,
+            hidden_states,
+            ctx,
+            residual,
+            self.norm,
+            fuse_embed_reduce=fuse_embed_reduce,
+        )
+
+        # Decide on pre-slice token count so this matches the path midlayer
+        # actually took; under draft reduce, hidden_states.shape[0] shrinks.
+        if midlayer.comm_manager.should_fuse(input_ids.shape[0]):
+            hidden_states_to_logits, hidden_states_to_aux = hidden_states, residual
+        else:
+            hidden_states_to_logits, hidden_states_to_aux = self.norm(
+                hidden_states, residual
+            )
+            hidden_states_to_logits, _ = midlayer.comm_manager.post_final_norm_comm(
+                hidden_states_to_logits, None, ctx
+            )
+            hidden_states_to_aux, _ = midlayer.comm_manager.post_final_norm_comm(
+                hidden_states_to_aux, None, ctx
+            )
+
+        if self.norm_output:
+            hidden_states_to_aux = hidden_states_to_logits
+
+        return hidden_states_to_logits, [hidden_states_to_aux]
+
+
+class LlamaForCausalLMEagle3(BaseCausalLM):
+
+    model_cls = Eagle3LlamaModel
+
+    def __init__(
+        self,
+        config: LlamaConfig,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+
+        nn.Module.__init__(self)
+        self.config = config
+        self.mapping = mapping
+        self.quant_config = quant_config
+
+        if self.config.num_hidden_layers != 1:
+            raise ValueError("EAGLE3 currently only supports 1 layer")
+
+        self.model = self.resolve_model(config, mapping, quant_config, prefix)
+
+        self.load_lm_head_from_target = False
+        if self.config.tie_word_embeddings:
+            if mapping.attn.has_dp and mapping.lm_head.has_tp:
+                raise ValueError(
+                    "--lm-head-tp-size > 1 vocab-shards the LM head, but this "
+                    "draft ties it to its replicated embedding (tie_word_embeddings)"
+                )
+            self.lm_head = self.model.embed_tokens
+        else:
+            if getattr(config, "draft_vocab_size", None) is None:
+                self.load_lm_head_from_target = True
+            # The draft's head follows the target's LM-head layout
+            # (mapping.lm_head): the shared target head arrives in that
+            # layout, and a draft-vocab head shards the same way.
+            self.lm_head = ParallelLMHead(
+                getattr(config, "draft_vocab_size", None) or config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                tp_rank=mapping.lm_head.tp_rank,
+                tp_size=mapping.lm_head.tp_size,
+                tp_group=mapping.lm_head.tp_group,
+                prefix=add_prefix("lm_head", prefix),
+            )
+
+        self.logits_processor = LogitsProcessor(
+            config,
+            skip_all_gather=self.mapping.attn.has_dp,
+            do_argmax=True,
+            tp_rank=self.mapping.lm_head.tp_rank,
+            tp_size=self.mapping.lm_head.tp_size,
+            tp_group=self.mapping.lm_head.tp_group,
+            dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
+        )
+        self.capture_aux_hidden_states = True
+        self.hot_token_id = None
+
+    def forward(
+        self,
+        ctx: ForwardContext,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
+            return super().forward(ctx, input_ids, positions, **kwargs)
+
+    def prepare_model_kwargs(
+        self, ctx: ForwardContext, input_ids: torch.Tensor, kwargs: dict
+    ) -> dict:
+        model_kwargs = super().prepare_model_kwargs(ctx, input_ids, kwargs)
+        captured_hidden_states = kwargs.get("captured_hidden_states")
+        if captured_hidden_states is not None:
+            model_kwargs["hidden_states"] = captured_hidden_states
+        else:
+            # During CUDA graph capture warmup, provide dummy hidden states.
+            num_tokens = input_ids.shape[0]
+            hidden_size = self.config.hidden_size
+            num_fc = self.model.num_fc_input_dim
+            model_kwargs["hidden_states"] = torch.zeros(
+                num_tokens,
+                hidden_size * num_fc,
+                dtype=torch.bfloat16,
+                device=input_ids.device,
+            )
+        return model_kwargs
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+
+        params_dict = dict(self.named_parameters())
+        stacked_params_mapping = [
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
+
+        for name, loaded_weight in weights:
+            # some Eagle3 checkpoints name the block "layers.0" not "midlayer"
+            if name.startswith("layers.0."):
+                name = "midlayer." + name[len("layers.0.") :]
+
+            if "d2t" in name:
+                self.hot_token_id = loaded_weight + torch.arange(
+                    loaded_weight.shape[0], device=loaded_weight.device
+                )
+                continue
+
+            if "t2d" in name:
+                continue
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                param_name = f"model.{name}" if name not in params_dict else name
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                param_name = name if name in params_dict else f"model.{name}"
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+
+    def get_hot_token_id(self):
+        return self.hot_token_id
+
+    def get_embed(self):
+        return self.model.embed_tokens.weight
+
+    def set_embed_and_head(self, embed, head):
+        # If draft hidden size != target hidden size, embed cannot be shared
+        if (
+            hasattr(self.config, "target_hidden_size")
+            and self.config.target_hidden_size != self.config.hidden_size
+        ):
+            return
+        if embed.shape != self.model.embed_tokens.weight.shape:
+            # Target embedding layout differs (e.g. replicated instead of
+            # vocab-parallel); rebuild the draft embedding to match it.
+            with torch.device("meta"):
+                replicated = VocabParallelEmbedding(
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    prefix="model.embed_tokens",
+                )
+            if embed.shape != replicated.weight.shape:
+                raise ValueError(
+                    f"Cannot share target embed of shape {tuple(embed.shape)}: "
+                    f"draft expects {tuple(self.model.embed_tokens.weight.shape)} "
+                    f"(sharded) or {tuple(replicated.weight.shape)} (replicated)."
+                )
+            self.model.embed_tokens = replicated
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        if head is not None and self.load_lm_head_from_target:
+            del self.lm_head.weight
+            self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+EntryClass = [LlamaForCausalLMEagle3]

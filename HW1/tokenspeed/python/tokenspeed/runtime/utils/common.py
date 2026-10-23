@@ -1,0 +1,1011 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Common utilities."""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import functools
+import io
+import json
+import logging
+import os
+import pickle
+import random
+import re
+import resource
+import subprocess
+import tempfile
+import threading
+from collections import OrderedDict
+from collections.abc import Callable, Sequence
+from functools import lru_cache
+from multiprocessing.reduction import ForkingPickler
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Protocol,
+    TypeVar,
+)
+
+import numpy as np
+import psutil
+import pybase64
+import torch
+import torch.distributed
+import torch.distributed as dist
+import zmq
+from starlette.routing import Mount
+from tokenspeed_kernel.platform import current_platform
+
+from tokenspeed.runtime.metrics.config import metrics_enabled
+from tokenspeed.runtime.utils.network import (  # noqa: F401
+    get_free_port,
+    is_valid_ipv6_address,
+)
+
+if TYPE_CHECKING:
+    import uvicorn
+
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
+
+time_infos = {}
+
+
+_warned_bool_env_var_keys = set()
+
+
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    # Runtime env helpers still read a few legacy keys directly until the
+    # central env module owns all boolean parsing.
+    value = os.getenv(name, default)
+    value = value.lower()
+
+    truthy_values = ("true", "1")
+    falsy_values = ("false", "0")
+
+    if (value not in truthy_values) and (value not in falsy_values):
+        if value not in _warned_bool_env_var_keys:
+            logger.warning(
+                f"get_bool_env_var({name!s}) see non-understandable value={value!s} and"
+                " treat as false",
+            )
+        _warned_bool_env_var_keys.add(value)
+
+    return value in truthy_values
+
+
+@lru_cache(maxsize=1)
+def get_device_module():
+    """Get the device module (cuda, hip, etc.) based on the current device."""
+    return torch.get_device_module()
+
+
+def maybe_inference_mode():
+    from tokenspeed.runtime.utils.env import envs
+
+    if envs.TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE.get():
+        return torch.inference_mode()
+    else:
+        return torch.no_grad()
+
+
+def maybe_set_numa_aware_cpu_affinity(device_id: int) -> None:
+    """Pin the current process to ``device_id``'s NUMA-local CPU set.
+
+    NVIDIA-only optimization. No-op if the env var is False, the platform is not
+    NVIDIA, or the process already has a constrained affinity (e.g., taskset).
+    """
+    from tokenspeed.runtime.utils.env import envs
+
+    if not envs.TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY.get():
+        return
+    platform = current_platform()
+    if not platform.is_nvidia:
+        return
+
+    proc = psutil.Process()
+    if proc.cpu_affinity() != list(range(psutil.cpu_count())):
+        return
+
+    if device_id >= len(platform.numa_cpu_affinity):
+        return
+
+    cpu_affinity = platform.numa_cpu_affinity[device_id]
+    if not cpu_affinity:
+        return
+
+    proc.cpu_affinity(list(cpu_affinity))
+    logger.info(
+        f"Worker process {proc.pid!s} pinned to {len(cpu_affinity)!s} NUMA-local CPUs "
+        f"for device {device_id!s}.",
+    )
+
+
+def get_available_gpu_memory(
+    device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
+):
+    """
+    Get available memory for cuda:gpu_id device.
+    When distributed is True, the available memory is the minimum available memory of all GPUs.
+    """
+    if device in {"cuda", "npu"}:
+        device_module = torch.get_device_module(device)
+        num_gpus = device_module.device_count()
+        if gpu_id >= num_gpus:
+            raise ValueError(f"gpu_id={gpu_id} must be less than num_gpus={num_gpus}.")
+
+        if device_module.current_device() != gpu_id:
+            logger.debug(
+                f"Current device is not {gpu_id!s}, but "
+                f"{device_module.current_device()!s}, which may cause useless "
+                "memory allocation for torch CUDA context.",
+            )
+
+        if empty_cache:
+            device_module.empty_cache()
+        free_gpu_memory, _ = device_module.mem_get_info(gpu_id)
+
+    if distributed:
+        tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
+        torch.distributed.all_reduce(
+            tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group
+        )
+        free_gpu_memory = tensor.item()
+
+    return free_gpu_memory / (1 << 30)
+
+
+def is_pin_memory_available() -> bool:
+    return torch.cuda.is_available()
+
+
+class LayerFn(Protocol):
+    def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
+
+
+class PPMissingLayer(torch.nn.Identity):
+    """Placeholder for a layer owned by another pipeline stage.
+
+    Keeps global layer numbering intact (KV field names, weight names, and
+    ``layer_id`` all stay global) while contributing no parameters, so the
+    weight loader's skip-unknown semantics leave it untouched.
+    """
+
+
+def make_layers(
+    num_hidden_layers: int,
+    layer_fn: LayerFn,
+    prefix: str = "",
+    pp_start_layer: int = 0,
+    pp_end_layer: int | None = None,
+) -> torch.nn.ModuleList:
+    """Make a list of layers with the given layer function.
+
+    Args:
+        num_hidden_layers: Total layer count of the model (all stages).
+        layer_fn: Factory called with the GLOBAL layer index.
+        prefix: Parameter-name prefix.
+        pp_start_layer: First global layer index this pipeline stage owns.
+        pp_end_layer: One past the last owned layer; None means all layers.
+
+    Returns:
+        A ModuleList of length ``num_hidden_layers`` where positions outside
+        [pp_start_layer, pp_end_layer) hold :class:`PPMissingLayer`.
+    """
+    if pp_end_layer is None:
+        pp_end_layer = num_hidden_layers
+    modules = torch.nn.ModuleList(
+        [
+            (
+                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                if pp_start_layer <= idx < pp_end_layer
+                else PPMissingLayer()
+            )
+            for idx in range(num_hidden_layers)
+        ]
+    )
+    return modules
+
+
+def set_random_seed(seed: int) -> None:
+    """Set the random seed for all libraries."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def set_ulimit(target_soft_limit=65535):
+    # number of open files
+    resource_type = resource.RLIMIT_NOFILE
+    current_soft, current_hard = resource.getrlimit(resource_type)
+
+    if current_soft < target_soft_limit:
+        try:
+            resource.setrlimit(resource_type, (target_soft_limit, current_hard))
+        except ValueError as e:
+            logger.warning(f"Failed to set RLIMIT_NOFILE: {e!s}")
+
+    # stack size
+    resource_type = resource.RLIMIT_STACK
+    current_soft, current_hard = resource.getrlimit(resource_type)
+    target_soft_limit_stack_size = 1024 * target_soft_limit
+    if current_soft < target_soft_limit_stack_size:
+        try:
+            resource.setrlimit(
+                resource_type, (target_soft_limit_stack_size, current_hard)
+            )
+        except ValueError as e:
+            logger.warning(f"Failed to set RLIMIT_STACK: {e!s}")
+
+
+def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
+    from tokenspeed.runtime.utils.env import envs
+
+    if envs.TOKENSPEED_USE_MODELSCOPE.get():
+        if not os.path.exists(model_path):
+            from modelscope import snapshot_download
+
+            from tokenspeed.runtime.model_loader.weight_utils import get_lock
+
+            with get_lock(model_path):
+                model_path = snapshot_download(model_path)
+            with get_lock(tokenizer_path):
+                tokenizer_path = snapshot_download(
+                    tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+                )
+    return model_path, tokenizer_path
+
+
+def configure_logger(server_args, prefix: str = ""):
+    global LOG_PREFIX
+    LOG_PREFIX = prefix
+
+    global LOG_LEVEL
+    LOG_LEVEL = server_args.log_level.upper()
+
+    from tokenspeed._logging import suppress_noisy_third_party_logs
+    from tokenspeed.runtime.utils.env import envs
+
+    suppress_noisy_third_party_logs()
+
+    if TOKENSPEED_LOGGING_CONFIG_PATH := envs.TOKENSPEED_LOGGING_CONFIG_PATH.get():
+        if not os.path.exists(TOKENSPEED_LOGGING_CONFIG_PATH):
+            raise FileNotFoundError(
+                "Setting TOKENSPEED_LOGGING_CONFIG_PATH from env with "
+                f"{TOKENSPEED_LOGGING_CONFIG_PATH} but it does not exist!"
+            )
+        with open(TOKENSPEED_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
+            custom_config = json.loads(file.read())
+        logging.config.dictConfig(custom_config)
+        suppress_noisy_third_party_logs()
+        return
+    format = f"[%(asctime)s{prefix}] %(message)s"
+    log_level = getattr(logging, server_args.log_level.upper())
+    logging.basicConfig(
+        level=log_level,
+        format=format,
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+
+    # Only set specified log level for tokenspeed-related loggers
+    for logger_name in logging.Logger.manager.loggerDict:
+        if "tokenspeed" in logger_name or logger_name.startswith("tokenspeed"):
+            logger_obj = logging.getLogger(logger_name)
+            if isinstance(logger_obj, logging.Logger):
+                logger_obj.setLevel(log_level)
+                for handler in logger_obj.handlers:
+                    handler.setLevel(log_level)
+
+    suppress_noisy_third_party_logs()
+
+
+def set_weight_attrs(
+    weight: torch.Tensor,
+    weight_attrs: dict[str, Any] | None,
+):
+    """Set attributes on a weight tensor.
+
+    This method is used to set attributes on a weight tensor. This method
+    will not overwrite existing attributes.
+
+    Args:
+        weight: The weight tensor.
+        weight_attrs: A dictionary of attributes to set on the weight tensor.
+    """
+    if weight_attrs is None:
+        return
+    for key, value in weight_attrs.items():
+        if hasattr(weight, key):
+            raise ValueError(f"Overwriting existing tensor attribute: {key}")
+        setattr(weight, key, value)
+
+
+class PipelinedPyobjBroadcaster:
+    """Overlap empty Python-object notifications with useful work."""
+
+    def __init__(
+        self,
+        rank: int,
+        dist_group: torch.distributed.ProcessGroup | None = None,
+        src: int = 0,
+    ) -> None:
+        self.rank = rank
+        self.dist_group = dist_group
+        self.src = src
+        self._data = None
+        self._ready = torch.zeros(1, dtype=torch.long)
+        self._work = None
+
+    @property
+    def in_flight(self) -> bool:
+        return self._work is not None
+
+    def start(self, data: list[Any] | None) -> None:
+        self._data = data
+        if self.rank == self.src:
+            self._ready[0] = bool(data)
+        self._work = dist.broadcast(
+            self._ready,
+            src=self.src,
+            group=self.dist_group,
+            async_op=True,
+        )
+
+    def finish(self) -> list[Any]:
+        self._work.wait()
+        data = self._data
+        self._data = None
+        self._work = None
+        if self._ready.item():
+            return broadcast_pyobj(data, self.rank, self.dist_group, src=self.src)
+        return data or []
+
+
+def broadcast_pyobj(
+    data: list[Any],
+    rank: int,
+    dist_group: torch.distributed.ProcessGroup | None = None,
+    src: int = 0,
+    force_cpu_device: bool = True,
+):
+    """Broadcast inputs from src rank to all other ranks with torch.dist backend.
+    The `rank` here refer to the source rank on global process group (regardless
+    of dist_group argument).
+    """
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
+    )
+
+    if rank == src:
+        if len(data) == 0:
+            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
+        else:
+            serialized_data = pickle.dumps(data)
+            size = len(serialized_data)
+
+            tensor_data = torch.ByteTensor(
+                np.frombuffer(serialized_data, dtype=np.uint8)
+            ).to(device)
+            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
+
+            dist.broadcast(tensor_size, src=src, group=dist_group)
+            dist.broadcast(tensor_data, src=src, group=dist_group)
+        return data
+    else:
+        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
+        dist.broadcast(tensor_size, src=src, group=dist_group)
+        size = tensor_size.item()
+
+        if size == 0:
+            return []
+
+        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
+        dist.broadcast(tensor_data, src=src, group=dist_group)
+
+        serialized_data = bytes(tensor_data.cpu().numpy())
+        data = pickle.loads(serialized_data)
+        return data
+
+
+step_counter = 0
+
+
+def get_zmq_socket(
+    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
+) -> zmq.Socket:
+    mem = psutil.virtual_memory()
+    total_mem = mem.total / 1024**3
+    available_mem = mem.available / 1024**3
+    if total_mem > 32 and available_mem > 16:
+        buf_size = int(0.5 * 1024**3)
+    else:
+        buf_size = -1
+
+    socket = context.socket(socket_type)
+    if endpoint.find("[") != -1:
+        socket.setsockopt(zmq.IPV6, 1)
+
+    def set_send_opt():
+        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.SNDBUF, buf_size)
+
+    def set_recv_opt():
+        socket.setsockopt(zmq.RCVHWM, 0)
+        socket.setsockopt(zmq.RCVBUF, buf_size)
+
+    if socket_type == zmq.PUSH:
+        set_send_opt()
+    elif socket_type == zmq.PULL:
+        set_recv_opt()
+    elif socket_type == zmq.DEALER:
+        set_send_opt()
+        set_recv_opt()
+    else:
+        raise ValueError(f"Unsupported socket type: {socket_type}")
+
+    if bind:
+        socket.bind(endpoint)
+    else:
+        socket.connect(endpoint)
+
+    return socket
+
+
+# Temporary directory for prometheus multiprocess mode
+# Cleaned up automatically when this object is garbage collected
+prometheus_multiproc_dir: tempfile.TemporaryDirectory
+
+
+def set_prometheus_multiproc_dir():
+    # Set prometheus multiprocess directory
+    # tokenspeed uses prometheus multiprocess mode
+    # we need to set this before importing prometheus_client
+    # https://prometheus.github.io/client_python/multiprocess/
+    global prometheus_multiproc_dir
+
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.debug("User set PROMETHEUS_MULTIPROC_DIR detected.")
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
+        )
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    logger.debug(
+        f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']!s}"
+    )
+
+
+def add_prometheus_middleware(app):
+    # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+
+    # Workaround for 307 Redirect for /metrics
+    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
+    app.routes.append(metrics_route)
+
+
+def get_amdgpu_memory_capacity():
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "No AMD GPU available. Ensure ROCm drivers and a ROCm-enabled "
+            "PyTorch build are installed and accessible."
+        )
+
+    # Query each visible device's total memory (bytes) via the torch API
+    # (torch.cuda is reused for ROCm/HIP), and return the minimum in MiB so
+    # the value matches the previous rocminfo-based implementation.
+    memory_values = [
+        torch.cuda.get_device_properties(i).total_memory // (1024 * 1024)
+        for i in range(torch.cuda.device_count())
+    ]
+
+    if not memory_values:
+        raise ValueError("No GPU memory values found.")
+
+    return min(memory_values)
+
+
+def get_nvgpu_memory_capacity():
+    try:
+        # Run nvidia-smi and capture the output
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"nvidia-smi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values
+        memory_values = [
+            float(mem)
+            for mem in result.stdout.strip().split("\n")
+            if re.match(r"^\d+(\.\d+)?$", mem.strip())
+        ]
+
+        if not memory_values:
+            # Fallback to torch.cuda.mem_get_info() when failed to get memory capacity from nvidia-smi,
+            # typically in NVIDIA MIG mode.
+            if torch.cuda.is_available():
+                logger.warning(
+                    "Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info()."
+                )
+                return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MB
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
+        )
+
+
+def crash_on_warnings():
+    # Crash on warning if we are running CI tests
+    return get_bool_env_var("CI") or get_bool_env_var("GITHUB_ACTIONS")
+
+
+def get_device_name(device_id: int = 0) -> str:
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        return torch.cuda.get_device_name(device_id)
+
+    return ""
+
+
+@lru_cache(maxsize=8)
+def get_device(device_id: int | None = None) -> str:
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        if device_id is None:
+            return "cuda"
+        return f"cuda:{device_id}"
+
+    raise RuntimeError("No accelerator (CUDA/ROCm) is available.")
+
+
+def dataclass_to_string_truncated(
+    data, max_length=2048, skip_names: set[str] | None = None
+):
+    if skip_names is None:
+        skip_names = set()
+    # Summarize tensors/ndarrays by shape — never str() the values (the bare
+    # str() fallthrough below would dump a whole multimodal feature tensor,
+    # bloating the request log).
+    if torch.is_tensor(data):
+        return f"Tensor(shape={tuple(data.shape)}, dtype={data.dtype})"
+    if isinstance(data, np.ndarray):
+        return f"ndarray(shape={tuple(data.shape)}, dtype={data.dtype})"
+    if isinstance(data, str):
+        if len(data) > max_length:
+            half_length = max_length // 2
+            return f"{repr(data[:half_length])} ... {repr(data[-half_length:])}"
+        else:
+            return f"{repr(data)}"
+    elif isinstance(data, (list, tuple)):
+        # Recurse element-wise (was ``str(data)``, which would dump nested
+        # tensors in full) and propagate skip_names.
+        if len(data) > max_length:
+            half_length = max_length // 2
+            shown = list(data[:half_length]) + ["..."] + list(data[-half_length:])
+        else:
+            shown = data
+        inner = ", ".join(
+            (
+                "..."
+                if x == "..."
+                else dataclass_to_string_truncated(x, max_length, skip_names)
+            )
+            for x in shown
+        )
+        return "[" + inner + "]"
+    elif isinstance(data, dict):
+        return (
+            "{"
+            + ", ".join(
+                f"'{k}': {dataclass_to_string_truncated(v, max_length, skip_names)}"
+                for k, v in data.items()
+                if k not in skip_names
+            )
+            + "}"
+        )
+    elif dataclasses.is_dataclass(data):
+        fields = dataclasses.fields(data)
+        return (
+            f"{data.__class__.__name__}("
+            + ", ".join(
+                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length, skip_names)}"
+                for f in fields
+                if f.name not in skip_names
+            )
+            + ")"
+        )
+    else:
+        return str(data)
+
+
+class MultiprocessingSerializer:
+    @staticmethod
+    def serialize(obj, output_str: bool = False):
+        """
+        Serialize a Python object using ForkingPickler.
+
+        Args:
+            obj: The object to serialize.
+            output_str (bool): If True, return a base64-encoded string instead of raw bytes.
+
+        Returns:
+            bytes or str: The serialized object.
+        """
+        buf = io.BytesIO()
+        ForkingPickler(buf).dump(obj)
+        buf.seek(0)
+        output = buf.read()
+
+        if output_str:
+            # Convert bytes to base64-encoded string
+            output = pybase64.b64encode(output).decode("utf-8")
+
+        return output
+
+    @staticmethod
+    def deserialize(data):
+        """
+        Deserialize a previously serialized object.
+
+        Args:
+            data (bytes or str): The serialized data, optionally base64-encoded.
+
+        Returns:
+            The deserialized Python object.
+        """
+        if isinstance(data, str):
+            # Decode base64 string to bytes
+            data = pybase64.b64decode(data, validate=True)
+
+        return ForkingPickler.loads(data)
+
+
+def nullable_str(val: str):
+    if not val or val == "None":
+        return None
+    return val
+
+
+def launch_dummy_health_check_server(host, port, enable_metrics):
+
+    import uvicorn
+    from fastapi import FastAPI, Response
+
+    app = FastAPI()
+
+    @app.get("/health")
+    async def health():
+        """Check the health of the http server."""
+        return Response(status_code=200)
+
+    @app.get("/health_generate")
+    async def health_generate():
+        """Check the health of the http server."""
+        return Response(status_code=200)
+
+    # Add prometheus middleware
+    if enable_metrics:
+        add_prometheus_middleware(app)
+
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        timeout_keep_alive=5,
+        loop="auto",
+        log_config=None,
+        log_level="warning",
+    )
+    server = uvicorn.Server(config=config)
+
+    try:
+        loop = asyncio.get_running_loop()
+        logger.info(
+            f"Dummy health check server scheduled on existing loop at {host!s}:{port!s}",
+        )
+        loop.create_task(server.serve())
+
+    except RuntimeError:
+        logger.info(f"Starting dummy health check server at {host!s}:{port!s}")
+        server.run()
+
+
+def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
+    """Serve the engine's Prometheus /metrics endpoint on a daemon thread.
+
+    With --enable-metrics every engine process on this node writes to the
+    shared PROMETHEUS_MULTIPROC_DIR; this serves the aggregate from the
+    engine's main process, which otherwise has no HTTP surface (the gRPC
+    servicer speaks gRPC only). The daemon thread keeps the synchronous
+    launch path free of event-loop assumptions. The socket is bound eagerly
+    on the calling thread, so a bind failure degrades to an error log and
+    None — metrics must never take down serving — and the
+    allocate-then-rebind race stays closed. Returns the ``uvicorn.Server``
+    (poll ``started`` for readiness), or None when --enable-metrics is off or
+    the bind failed.
+    """
+    if not metrics_enabled(server_args, "prometheus"):
+        return None
+
+    import uvicorn
+    from fastapi import FastAPI
+
+    host = server_args.metrics_host or server_args.host
+    port = server_args.metrics_port or get_free_port()
+
+    app = FastAPI()
+    add_prometheus_middleware(app)
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    try:
+        sock = config.bind_socket()
+    except SystemExit:
+        logger.error(
+            f"metrics server failed to bind {host!s}:{port!s}; "
+            "metrics endpoint disabled"
+        )
+        return None
+    server = uvicorn.Server(config)
+
+    def _serve():
+        try:
+            server.run(sockets=[sock])
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"metrics server stopped: {e!s}")
+
+    threading.Thread(target=_serve, daemon=True, name="engine-metrics-server").start()
+    logger.info(f"Prometheus metrics available at http://{host!s}:{port!s}/metrics")
+    return server
+
+
+def set_cuda_arch():
+    platform = current_platform()
+    if not platform.is_nvidia:
+        return
+
+    arch = f"{platform.arch_version.major}.{platform.arch_version.minor}"
+    os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+
+
+def round_up(x: int, y: int) -> int:
+    return ((x - 1) // y + 1) * y
+
+
+def add_prefix(name: str, prefix: str) -> str:
+    """Add a weight path prefix to a module name.
+
+    Args:
+        name: base module name.
+        prefix: weight prefix str to added to the front of `name` concatenated with `.`.
+
+    Returns:
+        The string `prefix.name` if prefix is non-empty, otherwise just `name`.
+    """
+    return name if not prefix else f"{prefix}.{name}"
+
+
+# Can be more general if it is used in multiple places (keep it simple and thus not general now)
+
+
+def log_info_on_rank0(logger, msg):
+    import torch.distributed as dist
+
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        logger.info(msg)
+
+
+T = TypeVar("T")
+
+
+class LazyValue:
+    def __init__(self, creator: Callable):
+        self._creator = creator
+        self._value = None
+
+    @property
+    def value(self):
+        if self._creator is not None:
+            self._value = self._creator()
+            self._creator = None
+        return self._value
+
+
+def ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
+# Only physical cores are used. Logical cores are excluded.
+
+
+def lru_cache_frozenset(maxsize=128):
+    def _to_hashable(o):
+        try:
+            hash(o)
+            return o
+        except TypeError:
+            # Not hashable; convert based on type
+            if isinstance(o, (dict)):
+                return frozenset(
+                    (_to_hashable(k), _to_hashable(v)) for k, v in o.items()
+                )
+            elif isinstance(o, set):
+                return frozenset(_to_hashable(v) for v in o)
+            elif isinstance(o, (list, tuple)) or (
+                isinstance(o, Sequence) and not isinstance(o, (str, bytes))
+            ):
+                return tuple(_to_hashable(v) for v in o)
+            else:
+                raise TypeError(f"Cannot make hashable: {type(o)}")
+
+    def decorator(func):
+        cache = OrderedDict()
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            h_args = tuple(_to_hashable(a) for a in args)
+            h_kwargs = frozenset(
+                (_to_hashable(k), _to_hashable(v)) for k, v in kwargs.items()
+            )
+            key = (h_args, h_kwargs)
+            if key in cache:
+                cache.move_to_end(key)
+                return cache[key]
+            result = func(*args, **kwargs)
+            cache[key] = result
+            if maxsize is not None and len(cache) > maxsize:
+                cache.popitem(last=False)
+            return result
+
+        wrapper.cache_clear = cache.clear  # For manual cache clearing
+        return wrapper
+
+    return decorator
+
+
+LOG_PREFIX = None
+LOG_LEVEL = "INFO"
+
+
+class CustomFormatter(logging.Formatter):
+    grey = "\x1b[38;20m"
+    yellow = "\x1b[33;20m"
+    red = "\x1b[31;20m"
+    bold_red = "\x1b[31;1m"
+    reset = "\x1b[0m"
+
+    FORMATS = None
+
+    def format(self, record):
+        if self.FORMATS is None:
+            format = f"[%(asctime)s {LOG_PREFIX}] - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)"
+            self.FORMATS = {
+                logging.DEBUG: self.grey + format + self.reset,
+                logging.INFO: self.grey + format + self.reset,
+                logging.WARNING: self.yellow + format + self.reset,
+                logging.ERROR: self.red + format + self.reset,
+                logging.CRITICAL: self.bold_red + format + self.reset,
+            }
+
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt)
+        return formatter.format(record)
+
+
+def get_colorful_logger(name):
+    logger = logging.getLogger(name)
+    logger.propagate = False
+    logger.setLevel(LOG_LEVEL)
+
+    # ``logging.getLogger`` returns the one logger per name; a second call for
+    # the same name must not stack a second stream handler, or every record
+    # of that logger is emitted twice.
+    if any(isinstance(h.formatter, CustomFormatter) for h in logger.handlers):
+        return logger
+
+    ch = logging.StreamHandler()
+    ch.setLevel(LOG_LEVEL)
+    ch.setFormatter(CustomFormatter())
+
+    logger.addHandler(ch)
+    return logger
+
+
+def _maybe_json_dict(path: str | os.PathLike) -> dict[str, str]:
+    with open(path) as f:
+        try:
+            value = json.loads(f.read())
+        except json.JSONDecodeError:
+            return dict[str, str]()
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        return dict[str, str]()
+    return value
+
+
+def _maybe_space_split_dict(path: str | os.PathLike) -> dict[str, str]:
+    parsed_dict = dict[str, str]()
+    with open(path) as f:
+        for line in f.readlines():
+            try:
+                model_name, redirect_name = line.strip().split()
+                parsed_dict[model_name] = redirect_name
+            except Exception:
+                pass
+    return parsed_dict
+
+
+def maybe_model_redirect(model: str) -> str:
+    """
+    Redirect the model name using a JSON string-to-string mapping or
+    whitespace-separated pairs. Other JSON values use the whitespace fallback.
+
+    :param model: hf model name
+    :return: maybe redirect to a local folder
+    """
+
+    from tokenspeed.runtime.utils.env import envs
+
+    model_redirect_path = envs.TOKENSPEED_MODEL_REDIRECT_PATH.get()
+
+    if not model_redirect_path:
+        return model
+
+    if not Path(model_redirect_path).exists():
+        return model
+
+    redirect_dict = _maybe_json_dict(model_redirect_path) or _maybe_space_split_dict(
+        model_redirect_path
+    )
+    if redirect_model := redirect_dict.get(model):
+        logger.info(f"model redirect: [ {model!s} ] -> [ {redirect_model!s} ]")
+        return redirect_model
+
+    return model
+
+
+def flatten_nested_list(nested_list):
+    if isinstance(nested_list, list):
+        return [
+            item for sublist in nested_list for item in flatten_nested_list(sublist)
+        ]
+    else:
+        return [nested_list]
